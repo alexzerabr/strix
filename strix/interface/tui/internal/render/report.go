@@ -12,15 +12,57 @@ import (
 // ---------------------------------------------------------------------------
 
 func renderVulnerabilityReport(args map[string]any, result any) string {
+	return renderReport(args, result, "Vulnerability Report", "Creating report...")
+}
+
+// A revision names the report it changes and carries only the fields it
+// replaces, so it renders the same sections with the ones it left alone absent.
+func renderVulnerabilityReportUpdate(args map[string]any, result any) string {
+	return renderReport(args, result, "Vulnerability Report Updated", "Updating report...")
+}
+
+// A deletion names the report it withdraws and the reason; the result carries
+// the title the report had, so the reader knows what left the scan.
+func renderVulnerabilityReportDelete(args map[string]any, result any) string {
 	resultMap, _ := result.(map[string]any)
 	var b strings.Builder
-	b.WriteString("🐞 " + Bold(ReportHdr).Render("Vulnerability Report"))
+	b.WriteString("🐞 " + Bold(ReportHdr).Render("Vulnerability Report Deleted"))
+
+	reportID := StringValue(args["report_id"])
+	if reportID != "" {
+		b.WriteString("\n\n" + Bold(Field).Render("Report: ") + reportID)
+	}
+	if title := StringValue(resultMap["title"]); title != "" {
+		b.WriteString("\n\n" + Bold(Field).Render("Title: ") + title)
+	}
+	if sev := StringValue(resultMap["severity"]); sev != "" {
+		b.WriteString("\n\n" + Bold(Field).Render("Severity: ") +
+			lipgloss.NewStyle().Bold(true).Foreground(SeverityColor(sev)).Render(strings.ToUpper(sev)))
+	}
+	if reason := StringValue(args["delete_reason"]); reason != "" {
+		b.WriteString("\n\n" + Bold(Field).Render("Reason") + "\n" + reason)
+	}
+	if errMsg := StringValue(resultMap["error"]); errMsg != "" {
+		b.WriteString("\n\n" + Col(SevHigh).Render(errMsg))
+	}
+	if reportID == "" {
+		b.WriteString("\n  " + Dim().Render("Deleting report..."))
+	}
+	return "\n\n" + b.String() + "\n\n"
+}
+
+func renderReport(args map[string]any, result any, heading, pending string) string {
+	resultMap, _ := result.(map[string]any)
+	var b strings.Builder
+	b.WriteString("🐞 " + Bold(ReportHdr).Render(heading))
 
 	field := func(label, value string) {
 		if value != "" {
 			b.WriteString("\n\n" + Bold(Field).Render(label+": ") + value)
 		}
 	}
+	reportID := StringValue(args["report_id"])
+	field("Report", reportID)
 	title := StringValue(args["title"])
 	field("Title", title)
 
@@ -59,6 +101,7 @@ func renderVulnerabilityReport(args map[string]any, result any) string {
 		}
 	}
 
+	section("Reason", StringValue(args["update_reason"]))
 	section("Description", StringValue(args["description"]))
 	section("Impact", StringValue(args["impact"]))
 	section("Technical Analysis", StringValue(args["technical_analysis"]))
@@ -76,8 +119,8 @@ func renderVulnerabilityReport(args map[string]any, result any) string {
 	// was verified belongs next to it rather than in the artifact alone.
 	section("Fix Verification", StringValue(args["fix_verification"]))
 
-	if title == "" {
-		b.WriteString("\n  " + Dim().Render("Creating report..."))
+	if title == "" && reportID == "" {
+		b.WriteString("\n  " + Dim().Render(pending))
 	}
 	return "\n\n" + b.String() + "\n\n"
 }

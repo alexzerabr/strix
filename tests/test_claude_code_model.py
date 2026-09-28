@@ -82,6 +82,13 @@ async def _drive(model: _ClaudeCodeModel) -> list[Any]:
     ]
 
 
+def _unwrap(model: object) -> object:
+    """Innermost model, past the logging and guard wrappers every route now carries."""
+    while hasattr(model, "_inner"):
+        model = model._inner
+    return model
+
+
 def _result_event(fixture: str) -> dict[str, Any]:
     lines = (FIXTURES / fixture).read_text(encoding="utf-8").splitlines()
     return claude_bridge.parse_transcript(lines)
@@ -193,8 +200,9 @@ def test_get_model_routes_claude_code(
 
     model = StrixProvider().get_model("claude-code/claude-opus-4-8")
     assert isinstance(model, _TurnGuardModel)
-    assert isinstance(model._inner, _ClaudeCodeModel)
-    # Subscription backends are never wrapped in the non-streaming shim.
+    assert isinstance(_unwrap(model), _ClaudeCodeModel)
+    # Subscription backends are never wrapped in the non-streaming shim, even
+    # with LLM_DISABLE_STREAMING set.
     assert not isinstance(model._inner, _NonStreamingModel)
 
 
@@ -208,7 +216,7 @@ def test_get_model_leaves_api_key_path_untouched(
 
     model = StrixProvider().get_model("anthropic/claude-opus-4-8")
     assert isinstance(model, _TurnGuardModel)
-    assert model._inner is sentinel
+    assert _unwrap(model) is sentinel
 
 
 def test_claude_code_uses_json_function_tools() -> None:
@@ -231,7 +239,7 @@ def test_claude_code_takes_priority_over_codex(
 
     model = StrixProvider().get_model("claude-code/claude-opus-4-8")
     assert isinstance(model, _TurnGuardModel)
-    assert isinstance(model._inner, _ClaudeCodeModel)
+    assert isinstance(_unwrap(model), _ClaudeCodeModel)
 
 
 # --------------------------------------------------------------------------- #

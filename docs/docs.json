@@ -25,7 +25,8 @@
             "pages": [
               "usage/cli",
               "usage/scan-modes",
-              "usage/instructions"
+              "usage/instructions",
+              "usage/viewer"
             ]
           },
           {
@@ -36,6 +37,7 @@
               "llm-providers/anthropic",
               "llm-providers/claude-code",
               "llm-providers/openrouter",
+              "llm-providers/vercel-ai-gateway",
               "llm-providers/vertex",
               "llm-providers/bedrock",
               "llm-providers/azure",
@@ -78,7 +80,8 @@
           {
             "group": "Strix Cloud",
             "pages": [
-              "cloud/overview"
+              "cloud/overview",
+              "cloud/cli"
             ]
           }
         ]

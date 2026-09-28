@@ -14,6 +14,7 @@ fails the run.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -30,12 +31,16 @@ from agents.mcp import (
     create_static_tool_filter,
 )
 from mcp.client.stdio import stdio_client
+from mcp.shared._httpx_utils import create_mcp_http_client
 
+from strix.tools.mcp.failures import HttpStatusRecorder
 from strix.tools.mcp.session import McpConnectionUnavailableError, SupervisedMcpSession
 
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    import httpx
 
     from strix.tools.mcp.config import McpConnectionConfig
     from strix.tools.mcp.registry import McpConnectionRequest, McpRegistry
@@ -69,6 +74,13 @@ class ConnectedMcpServer(NamedTuple):
     name: str
     tool_count: int
     notes: str | None = None
+
+
+class BuiltMcpServer(NamedTuple):
+    """A constructed SDK server and its optional HTTP failure recorder."""
+
+    server: MCPServer
+    recorder: HttpStatusRecorder | None
 
 
 def _auth_headers(config: McpConnectionConfig) -> dict[str, str]:
@@ -108,8 +120,11 @@ class _QuietMCPServerStdio(MCPServerStdio):
         return _quiet_stdio_streams(self.params)
 
 
-def _build_server(config: McpConnectionConfig) -> MCPServer:
+def _build_server(config: McpConnectionConfig) -> BuiltMcpServer:
     """Construct (but do not connect) the SDK server for one connection.
+
+    The returned tuple carries the server and, for HTTP connections, a recorder
+    that retains sanitized response metadata for the owning session.
 
     When ``allowed_tools`` is a list the static filter means the server will not
     even list tools outside it, so it is the authoritative gate on what
@@ -128,22 +143,43 @@ def _build_server(config: McpConnectionConfig) -> MCPServer:
             "args": config.args,
             "env": config.env,
         }
-        return _QuietMCPServerStdio(
-            params=stdio_params,
-            name=config.name,
-            tool_filter=tool_filter,
-            cache_tools_list=True,
+        return BuiltMcpServer(
+            _QuietMCPServerStdio(
+                params=stdio_params,
+                name=config.name,
+                tool_filter=tool_filter,
+                cache_tools_list=True,
+            ),
+            None,
         )
+
+    recorder = HttpStatusRecorder()
+
+    def httpx_client_factory(
+        headers: dict[str, str] | None = None,
+        timeout: httpx.Timeout | None = None,
+        auth: httpx.Auth | None = None,
+    ) -> httpx.AsyncClient:
+        client = create_mcp_http_client(headers=headers, timeout=timeout, auth=auth)
+        client.event_hooks.setdefault("response", []).append(recorder)
+        return client
 
     http_params: MCPServerStreamableHttpParams = {
         "url": cast("str", config.url),
         "headers": _auth_headers(config),
+        "timeout": config.http_timeout_seconds,
+        "sse_read_timeout": config.sse_read_timeout_seconds,
+        "httpx_client_factory": httpx_client_factory,
     }
-    return MCPServerStreamableHttp(
-        params=http_params,
-        name=config.name,
-        tool_filter=tool_filter,
-        cache_tools_list=True,
+    return BuiltMcpServer(
+        MCPServerStreamableHttp(
+            params=http_params,
+            name=config.name,
+            tool_filter=tool_filter,
+            cache_tools_list=True,
+            client_session_timeout_seconds=config.session_timeout_seconds,
+        ),
+        recorder,
     )
 
 
@@ -246,8 +282,10 @@ async def _count_session_tools(config: McpConnectionConfig, session: SupervisedM
 
 async def connect_mcp_servers(
     configs: list[McpConnectionConfig],
+    *,
+    max_concurrency: int = 6,
 ) -> list[ConnectedMcpServer]:
-    """Connect each MCP config on its own supervising task and return the sessions.
+    """Connect MCP configs concurrently under a fixed bound.
 
     Each connection becomes a :class:`~strix.tools.mcp.session.SupervisedMcpSession`
     that owns ``connect()``, the held-open session, and ``cleanup()`` on one
@@ -266,41 +304,43 @@ async def connect_mcp_servers(
     :class:`~strix.tools.mcp.registry.McpRegistry` from these sessions, and the
     agent reaches each tool on demand through ``describe_mcp`` / ``call_mcp``.
     """
-    connected: list[ConnectedMcpServer] = []
+    semaphore = asyncio.Semaphore(max(1, max_concurrency))
     sessions: list[SupervisedMcpSession] = []
-    try:
-        for config in configs:
+
+    async def connect_one(config: McpConnectionConfig) -> ConnectedMcpServer | None:
+        async with semaphore:
             session = SupervisedMcpSession(config)
             sessions.append(session)
-            if not await session.start():
-                # Initial connect failed; already logged inside the session. Drop it.
-                await session.aclose()
-                sessions.remove(session)
-                continue
             try:
+                if not await session.start():
+                    await session.aclose()
+                    return None
                 tool_count = await _count_session_tools(config, session)
             except McpConnectionUnavailableError:
-                # The session died between connecting and its first listing; skip it.
                 logger.warning("MCP connection %r died before its first listing", config.name)
                 await session.aclose()
-                sessions.remove(session)
-                continue
+                return None
+            except BaseException:
+                with contextlib.suppress(BaseException):
+                    await session.aclose()
+                raise
             logger.info("Connected MCP server %r (%d tools)", config.name, tool_count)
-            connected.append(
-                ConnectedMcpServer(
-                    session=session, name=config.name, tool_count=tool_count, notes=config.notes
-                )
+            return ConnectedMcpServer(
+                session=session,
+                name=config.name,
+                tool_count=tool_count,
+                notes=config.notes,
             )
-    except BaseException:
-        # Cancelled or errored mid-attach: close every session started so far,
-        # each on its own task, then re-raise. The runner only receives the list
-        # on a clean return, so on an abnormal exit this function owns the cleanup.
-        for session in sessions:
-            with contextlib.suppress(BaseException):
-                await session.aclose()
-        raise
 
-    return connected
+    try:
+        results = await asyncio.gather(*(connect_one(config) for config in configs))
+    except BaseException:
+        await asyncio.gather(
+            *(session.aclose() for session in sessions),
+            return_exceptions=True,
+        )
+        raise
+    return [result for result in results if result is not None]
 
 
 async def attach_mcp_requests(

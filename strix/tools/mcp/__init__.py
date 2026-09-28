@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from strix.tools.mcp.agent_tools import call_mcp, describe_mcp, list_mcps
+from strix.tools.mcp.agent_tools import (
+    call_mcp,
+    describe_mcp,
+    get_mcp_tool_schema,
+    list_mcps,
+    search_mcp_tools,
+)
 from strix.tools.mcp.client import (
     ConnectedMcpServer,
     attach_mcp_requests,
@@ -13,13 +19,16 @@ from strix.tools.mcp.config import (
     McpAuth,
     McpConnectionConfig,
 )
+from strix.tools.mcp.failures import FailureInfo, HttpStatusRecorder, classify
 from strix.tools.mcp.loader import load_user_mcp_configs
 from strix.tools.mcp.naming import namespaced_tool_name
 from strix.tools.mcp.registry import (
     CALL_MCP_TOOL,
     DESCRIBE_MCP_TOOL,
+    GET_MCP_TOOL_SCHEMA_TOOL,
     MCP_DISPATCH_TOOLS,
     MCP_REGISTRY_CONTEXT_KEY,
+    SEARCH_MCP_TOOLS_TOOL,
     McpCallInfo,
     McpConnectionEntry,
     McpConnectionRequest,
@@ -34,10 +43,14 @@ from strix.tools.mcp.session import McpConnectionUnavailableError, SupervisedMcp
 __all__ = [
     "CALL_MCP_TOOL",
     "DESCRIBE_MCP_TOOL",
+    "GET_MCP_TOOL_SCHEMA_TOOL",
     "MCP_DISPATCH_TOOLS",
     "MCP_REGISTRY_CONTEXT_KEY",
+    "SEARCH_MCP_TOOLS_TOOL",
     "BearerAuth",
     "ConnectedMcpServer",
+    "FailureInfo",
+    "HttpStatusRecorder",
     "McpAuth",
     "McpCallInfo",
     "McpConnectionConfig",
@@ -50,10 +63,13 @@ __all__ = [
     "SupervisedMcpSession",
     "attach_mcp_requests",
     "call_mcp",
+    "classify",
     "connect_mcp_servers",
     "describe_mcp",
+    "get_mcp_tool_schema",
     "list_mcps",
     "load_user_mcp_configs",
     "namespaced_tool_name",
     "resolve_mcp_call",
+    "search_mcp_tools",
 ]

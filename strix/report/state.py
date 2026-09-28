@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import subprocess
 import threading
 from collections.abc import Callable
@@ -32,6 +33,25 @@ logger = logging.getLogger(__name__)
 
 _global_report_state: Optional["ReportState"] = None
 
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+class ReportRollbackError(RuntimeError):
+    """Raised when a failed deletion could not rewrite the on-disk indexes.
+
+    The report is still on file in memory; the indexes are rewritten from
+    memory on the next save.
+    """
+
+    def __init__(self, report_id: str, *, cause: BaseException) -> None:
+        self.report_id = report_id
+        self.cause = cause
+        super().__init__(
+            f"Deletion of report '{report_id}' failed ({cause}) and the on-disk indexes "
+            "could not be restored; the report is still on file and the indexes are "
+            "rewritten on the next save"
+        )
+
 
 def _strix_version() -> str | None:
     """Best-effort package version for the SARIF tool.driver.version field."""
@@ -39,6 +59,68 @@ def _strix_version() -> str | None:
         return version("strix-agent")
     except PackageNotFoundError:
         return None
+
+
+# Content a revision may replace. The identity of the finding (id, timestamp,
+# finding_class) and its original author stay put. dependency_metadata is
+# replaced whole, so a caller carries the package identity over itself.
+UPDATABLE_REPORT_FIELDS = frozenset(
+    {
+        "title",
+        "dependency_metadata",
+        "severity",
+        "description",
+        "impact",
+        "target",
+        "technical_analysis",
+        "poc_description",
+        "poc_script_code",
+        "remediation_steps",
+        "evidence",
+        "assumptions",
+        "counterevidence",
+        "confidence",
+        "confidence_rationale",
+        "severity_change_conditions",
+        "fix_effort",
+        "cvss",
+        "cvss_breakdown",
+        "endpoint",
+        "method",
+        "cve",
+        "cwe",
+        "code_locations",
+        "http_exchange_ids",
+        "fix_verification",
+        "fix_pr_body",
+    }
+)
+
+_LOWERCASE_REPORT_FIELDS = frozenset({"severity", "confidence", "fix_effort"})
+
+# Fields that only describe another field. A revision may raise the rating or
+# replace the locations without restating the reasoning behind the old one, and
+# that leftover reasoning then contradicts the finding it annotates
+# ("confidence: high" beside a rationale calling the evidence unconfirmed). When
+# the field they describe changes and the update carries no replacement, they
+# are dropped rather than kept.
+_DEPENDENT_REPORT_FIELDS: dict[str, tuple[str, ...]] = {
+    "confidence": ("confidence_rationale",),
+    "severity": ("severity_change_conditions",),
+    "cvss": ("cvss_breakdown",),
+    "code_locations": ("fix_verification",),
+}
+
+
+def _clean_title(title: str) -> str:
+    """Return a single-line finding title.
+
+    A title quotes text from the scanned target, so it can carry newlines, tabs or
+    other control characters. Those break every artifact that renders the title on
+    one line, such as the markdown heading, the CSV cell and the TUI list. Control
+    characters become spaces and runs of whitespace collapse to one space.
+    """
+    return " ".join(_CONTROL_CHARS.sub(" ", title).split())
 
 
 def _number(value: Any) -> int | float:
@@ -103,7 +185,7 @@ def get_global_report_state() -> Optional["ReportState"]:
     return _global_report_state
 
 
-def set_global_report_state(report_state: "ReportState") -> None:
+def set_global_report_state(report_state: Optional["ReportState"]) -> None:
     global _global_report_state  # noqa: PLW0603
     _global_report_state = report_state
     # New run: drop any streamed-cost entries a prior run left unconsumed.
@@ -155,6 +237,8 @@ class ReportState:
 
         self.caido_url: str | None = None
         self.vulnerability_found_callback: Callable[[dict[str, Any]], None] | None = None
+        self.vulnerability_updated_callback: Callable[[dict[str, Any]], None] | None = None
+        self.vulnerability_deleted_callback: Callable[[dict[str, Any]], None] | None = None
 
         self._sarif_repo_ctx: dict[str, Any] | None = None
         self._sarif_repo_ctx_ready: bool = False
@@ -222,8 +306,21 @@ class ReportState:
                 )
             self.vulnerability_reports = [r for r in data if isinstance(r, dict)]
             for r in self.vulnerability_reports:
+                # A finding written before the class was persisted still carries the
+                # metadata of its class, so name the class it always had.
+                if not r.get("finding_class"):
+                    r["finding_class"] = (
+                        "dependency_cve" if r.get("dependency_metadata") else "dynamic"
+                    )
+                title = r.get("title")
+                stale_md = False
+                if isinstance(title, str):
+                    r["title"] = _clean_title(title)
+                    stale_md = r["title"] != title
                 rid = r.get("id")
-                if isinstance(rid, str):
+                # A finding already on disk keeps its markdown, unless cleaning
+                # changed the title: the heading on disk then needs a rewrite.
+                if isinstance(rid, str) and not stale_md:
                     self._saved_vuln_ids.add(rid)
             logger.info(
                 "report state hydrated %d vulnerability report(s)",
@@ -255,6 +352,7 @@ class ReportState:
         cve: str | None = None,
         cwe: str | None = None,
         code_locations: list[dict[str, Any]] | None = None,
+        http_exchange_ids: list[str] | None = None,
         fix_verification: str | None = None,
         fix_pr_body: str | None = None,
         finding_class: str | None = None,
@@ -262,11 +360,11 @@ class ReportState:
         agent_id: str | None = None,
         agent_name: str | None = None,
     ) -> str:
-        report_id = f"vuln-{len(self.vulnerability_reports) + 1:04d}"
+        report_id = self._next_report_id()
 
         report: dict[str, Any] = {
             "id": report_id,
-            "title": title.strip(),
+            "title": _clean_title(title),
             "severity": severity.lower().strip(),
             "timestamp": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC"),
         }
@@ -313,6 +411,8 @@ class ReportState:
             report["cwe"] = cwe.strip()
         if code_locations:
             report["code_locations"] = code_locations
+        if http_exchange_ids:
+            report["http_exchange_ids"] = http_exchange_ids
         if fix_verification:
             report["fix_verification"] = fix_verification.strip()
         if fix_pr_body:
@@ -325,16 +425,214 @@ class ReportState:
         if agent_name:
             report["agent_name"] = agent_name
 
+        if self.vulnerability_found_callback:
+            self.vulnerability_found_callback(report)
+
         self.vulnerability_reports.append(report)
         logger.info(f"Added vulnerability report: {report_id} - {title}")
         posthog.finding(severity, cwe=cwe, is_cve=bool(cve))
         scarf.finding(severity, cwe=cwe, is_cve=bool(cve))
 
-        if self.vulnerability_found_callback:
-            self.vulnerability_found_callback(report)
-
         self.save_run_data()
         return report_id
+
+    def _deleted_vulnerability_reports(self) -> list[dict[str, Any]]:
+        raw = self.run_record.get("deleted_vulnerability_reports")
+        return [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+
+    def _next_report_id(self) -> str:
+        """Allocate the id after every id this run has ever handed out.
+
+        A deleted report leaves the list, so counting entries would hand its id
+        to the next finding and let that finding overwrite the deleted MD on disk
+        and inherit its history in every consumer that keys on the id.
+        """
+        used = 0
+        for entry in [*self.vulnerability_reports, *self._deleted_vulnerability_reports()]:
+            match = re.fullmatch(r"vuln-(\d+)", str(entry.get("id", "")))
+            if match:
+                used = max(used, int(match.group(1)))
+        return f"vuln-{used + 1:04d}"
+
+    def update_vulnerability_report(
+        self,
+        report_id: str,
+        fields: dict[str, Any],
+        *,
+        update_reason: str | None = None,
+        updated_by_agent_id: str | None = None,
+        updated_by_agent_name: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Apply a revision to an existing report, keeping its id.
+
+        A field that only describes a field this update replaces is dropped when
+        the update carries no replacement for it, so the revised report cannot
+        state a new rating beside the superseded reasoning for the old one.
+
+        Returns the revised report, or ``None`` when the id is unknown or when
+        nothing in ``fields`` changes it.
+        """
+        report = next((r for r in self.vulnerability_reports if r.get("id") == report_id), None)
+        if report is None:
+            logger.warning("cannot update unknown vulnerability report %s", report_id)
+            return None
+
+        changed: dict[str, Any] = {}
+        for key, raw_value in fields.items():
+            if key not in UPDATABLE_REPORT_FIELDS or raw_value is None:
+                continue
+            value = raw_value
+            if isinstance(value, str):
+                value = _clean_title(value) if key == "title" else value.strip()
+                if key in _LOWERCASE_REPORT_FIELDS:
+                    value = value.lower()
+                if not value:
+                    continue
+            if report.get(key) == value:
+                continue
+            changed[key] = value
+
+        superseded = {
+            dependent
+            for primary, dependents in _DEPENDENT_REPORT_FIELDS.items()
+            if primary in changed
+            for dependent in dependents
+            if dependent not in changed and report.get(dependent) not in (None, "", [], {})
+        }
+
+        if not changed and not superseded:
+            logger.info("update for %s carried no new content; keeping it as is", report_id)
+            return None
+
+        entry: dict[str, Any] = {
+            "timestamp": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "fields": sorted(changed),
+        }
+        if superseded:
+            entry["dropped_fields"] = sorted(superseded)
+        if update_reason and update_reason.strip():
+            entry["reason"] = update_reason.strip()[:500]
+        if updated_by_agent_id:
+            entry["agent_id"] = updated_by_agent_id
+        if updated_by_agent_name:
+            entry["agent_name"] = updated_by_agent_name
+        for key in ("severity", "cvss", "confidence"):
+            if key in changed and report.get(key) is not None:
+                entry[f"previous_{key}"] = report[key]
+
+        raw_history = report.get("update_history")
+        history: list[dict[str, Any]] = (
+            [e for e in raw_history if isinstance(e, dict)] if isinstance(raw_history, list) else []
+        )
+        history.append(entry)
+
+        revised = {**report, **changed}
+        for dependent in superseded:
+            revised.pop(dependent, None)
+        revised["update_history"] = history
+        revised["updated_at"] = entry["timestamp"]
+
+        # Persistence must accept the revision before local state changes. A
+        # failed callback leaves the old evidence intact and the update retryable.
+        if self.vulnerability_updated_callback:
+            self.vulnerability_updated_callback(revised)
+        report.clear()
+        report.update(revised)
+
+        # The markdown on disk still shows the superseded evidence, so let the
+        # writer re-render it.
+        self._saved_vuln_ids.discard(report_id)
+
+        logger.info(
+            "Updated vulnerability report %s (%s)",
+            report_id,
+            ", ".join(entry["fields"]) or "no field replaced",
+        )
+
+        self.save_run_data()
+        return report
+
+    def delete_vulnerability_report(
+        self,
+        report_id: str,
+        *,
+        delete_reason: str,
+        deleted_by_agent_id: str | None = None,
+        deleted_by_agent_name: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Withdraw a report from the run, keeping a record of the withdrawal.
+
+        Returns the removed report, or ``None`` when the id is unknown. Every
+        agent in a run shares one trust boundary, so any of them may withdraw
+        any report (just as any of them may revise one); the run record keeps
+        who filed it, who withdrew it and why. The report leaves
+        ``vulnerability_reports`` and its rendered artifacts, and its id is
+        never reissued.
+
+        The rewritten artifacts and the ``vulnerability_deleted_callback`` must
+        both accept the deletion first: if either fails the report is put back
+        and the error propagates, so the deletion can be retried
+        (:class:`ReportRollbackError` when the indexes could not be put back).
+        """
+        report = next((r for r in self.vulnerability_reports if r.get("id") == report_id), None)
+        if report is None:
+            logger.warning("cannot delete unknown vulnerability report %s", report_id)
+            return None
+
+        entry: dict[str, Any] = {
+            "id": report_id,
+            "title": report.get("title"),
+            "severity": report.get("severity"),
+            "filed_at": report.get("timestamp"),
+            "deleted_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "reason": delete_reason.strip()[:500],
+        }
+        if report.get("agent_id"):
+            entry["filed_by_agent_id"] = report["agent_id"]
+        if deleted_by_agent_id:
+            entry["agent_id"] = deleted_by_agent_id
+        if deleted_by_agent_name:
+            entry["agent_name"] = deleted_by_agent_name
+
+        position = self.vulnerability_reports.index(report)
+        was_saved = report_id in self._saved_vuln_ids
+        history = self._deleted_vulnerability_reports()
+
+        self.vulnerability_reports.remove(report)
+        self._saved_vuln_ids.discard(report_id)
+        self.run_record["deleted_vulnerability_reports"] = [*history, entry]
+        try:
+            # Local artifacts first: they can be put back if persistence then
+            # refuses, whereas a row deleted elsewhere cannot.
+            self._sync_llm_usage_record()
+            self._write_artifacts()
+            if self.vulnerability_deleted_callback:
+                self.vulnerability_deleted_callback({**report, "deletion": entry})
+        except Exception as exc:
+            self.vulnerability_reports.insert(position, report)
+            if was_saved:
+                self._saved_vuln_ids.add(report_id)
+            if history:
+                self.run_record["deleted_vulnerability_reports"] = history
+            else:
+                self.run_record.pop("deleted_vulnerability_reports", None)
+            try:
+                self._write_artifacts()
+            except Exception as rollback_exc:
+                logger.exception(
+                    "could not restore artifacts after failed deletion of %s", report_id
+                )
+                raise ReportRollbackError(report_id, cause=exc) from rollback_exc
+            raise
+
+        md_path = self.get_run_dir() / "vulnerabilities" / f"{report_id}.md"
+        try:
+            md_path.unlink(missing_ok=True)
+        except OSError:
+            logger.exception("could not remove %s", md_path)
+
+        logger.info("Deleted vulnerability report %s - %s", report_id, report.get("title"))
+        return report
 
     def get_existing_vulnerabilities(self) -> list[dict[str, Any]]:
         return list(self.vulnerability_reports)
@@ -519,46 +817,53 @@ class ReportState:
             return None
 
     def _save_artifacts(self) -> None:
-        """Write scan artifacts under ``run_dir``."""
-        run_dir = self.get_run_dir()
+        """Write scan artifacts under ``run_dir``; a write failure is logged."""
         try:
-            run_dir.mkdir(parents=True, exist_ok=True)
-
-            coverage = self._coverage_document()
-            if coverage is not None:
-                try:
-                    write_coverage(run_dir, coverage)
-                except OSError:
-                    logger.exception("coverage.json write failed (non-fatal)")
-
-            if self.final_scan_result:
-                write_executive_report(run_dir, self.final_scan_result)
-
-            if self.vulnerability_reports:
-                write_vulnerabilities(run_dir, self.vulnerability_reports, self._saved_vuln_ids)
-
-            # SARIF 2.1.0 emitter for CI / ASPM integration. Always emit (even
-            # empty) so a clean run overwrites a prior findings.sarif rather than
-            # leaving a stale one — codeql-action's "absent from new submission →
-            # fixed" needs the fresh empty doc to auto-resolve alerts. Isolated
-            # in its own try: a SARIF-build error must NEVER break the CSV/MD/
-            # run-record path (the emitter's own contract).
-            try:
-                write_sarif(
-                    run_dir,
-                    self.vulnerability_reports,
-                    tool_version=_strix_version(),
-                    repository_context=self._sarif_repository_context(),
-                    coverage=coverage,
-                )
-            except Exception:
-                logger.exception("SARIF emit failed (non-fatal; CSV/MD unaffected)")
-
-            write_run_record(run_dir, self.run_record)
-
-            logger.info("Essential scan data saved to: %s", run_dir)
+            self._write_artifacts()
         except (OSError, RuntimeError):
             logger.exception("Failed to save scan data")
+
+    def _write_artifacts(self) -> None:
+        """Write scan artifacts under ``run_dir``, raising when the index or
+        run record cannot be written."""
+        run_dir = self.get_run_dir()
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        coverage = self._coverage_document()
+        if coverage is not None:
+            try:
+                write_coverage(run_dir, coverage)
+            except OSError:
+                logger.exception("coverage.json write failed (non-fatal)")
+
+        if self.final_scan_result:
+            write_executive_report(run_dir, self.final_scan_result)
+
+        # An index is written for an empty list too once a report was
+        # deleted, or the CSV/JSON on disk would still list it.
+        if self.vulnerability_reports or self._deleted_vulnerability_reports():
+            write_vulnerabilities(run_dir, self.vulnerability_reports, self._saved_vuln_ids)
+
+        # SARIF 2.1.0 emitter for CI / ASPM integration. Always emit (even
+        # empty) so a clean run overwrites a prior findings.sarif rather than
+        # leaving a stale one — codeql-action's "absent from new submission →
+        # fixed" needs the fresh empty doc to auto-resolve alerts. Isolated
+        # in its own try: a SARIF-build error must NEVER break the CSV/MD/
+        # run-record path (the emitter's own contract).
+        try:
+            write_sarif(
+                run_dir,
+                self.vulnerability_reports,
+                tool_version=_strix_version(),
+                repository_context=self._sarif_repository_context(),
+                coverage=coverage,
+            )
+        except Exception:
+            logger.exception("SARIF emit failed (non-fatal; CSV/MD unaffected)")
+
+        write_run_record(run_dir, self.run_record)
+
+        logger.info("Essential scan data saved to: %s", run_dir)
 
     def _sarif_repository_context(self) -> dict[str, Any] | None:
         """Repo/commit/branch context for SARIF provenance (repo scans only).

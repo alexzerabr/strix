@@ -98,6 +98,14 @@ Examples:
   # Extra files placed in the sandbox workspace
   strix --target ./my-project --workspace-file ./wordlist.txt
   strix --target https://app.com --workspace-file ./openapi.yaml:specs/openapi.yaml
+
+Strix Cloud:
+  strix cloud login
+  strix cloud scans start --source . --yes --wait
+  strix cloud                      # list every cloud resource
+
+  Run a pentest in Strix Cloud     https://app.strix.ai
+  Try Strix Enterprise             https://strix.ai/demo
         """,
     )
 
@@ -163,8 +171,9 @@ Examples:
         help="Place a file from this machine into the sandbox workspace before the scan "
         "starts, for example a wordlist, an API specification, or notes. Repeat the option "
         "for more files. DEST is the path inside /workspace and defaults to the file name "
-        "(for example '--workspace-file ./wordlist.txt:lists/wordlist.txt'). The file is "
-        "read-only inside the sandbox and lands outside every target directory.",
+        "(for example '--workspace-file ./wordlist.txt:lists/wordlist.txt'). Strix copies "
+        "the file into the sandbox, outside every target directory. The agent can edit the "
+        "copy. The file on this machine does not change.",
     )
 
     parser.add_argument(

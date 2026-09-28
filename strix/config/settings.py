@@ -9,6 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+ApiType = Literal["responses", "chat_completions"]
 
 DEFAULT_MAX_TURNS = 500
 
@@ -23,6 +24,11 @@ class LlmSettings(BaseSettings):
     model_config = _BASE_CONFIG
 
     model: str | None = Field(default=None, alias="STRIX_LLM")
+    api_type: ApiType | None = Field(
+        default=None,
+        validation_alias=AliasChoices("STRIX_API_TYPE", "STRIX_FORCE_API"),
+        description="Force 'responses' or 'chat_completions' API path",
+    )
     api_key: str | None = Field(
         default=None,
         validation_alias=AliasChoices("LLM_API_KEY", "OPENAI_API_KEY"),
@@ -120,6 +126,10 @@ class TelemetrySettings(BaseSettings):
     enabled: bool = Field(default=True, alias="STRIX_TELEMETRY")
 
 
+WebSearchProvider = Literal["auto", "perplexity", "exa"]
+ExaSearchType = Literal["auto", "fast", "instant", "deep-lite", "deep", "deep-reasoning"]
+
+
 class IntegrationSettings(BaseSettings):
     model_config = _BASE_CONFIG
 
@@ -127,6 +137,25 @@ class IntegrationSettings(BaseSettings):
         default=None,
         alias="PERPLEXITY_API_KEY",
         repr=False,
+    )
+    exa_api_key: str | None = Field(
+        default=None,
+        alias="EXA_API_KEY",
+        repr=False,
+    )
+    web_search_provider: WebSearchProvider = Field(
+        default="auto",
+        alias="STRIX_WEB_SEARCH_PROVIDER",
+    )
+    exa_search_type: ExaSearchType = Field(
+        default="auto",
+        alias="STRIX_EXA_SEARCH_TYPE",
+    )
+    exa_num_results: int = Field(
+        default=5,
+        ge=1,
+        le=100,
+        alias="STRIX_EXA_NUM_RESULTS",
     )
     postman_api_key: str | None = Field(
         default=None,
