@@ -39,19 +39,25 @@ def register_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     async def strix_scan_start(
-        project: str,
+        project: str | None = None,
         scan_mode: str = "quick",
         instruction: str | None = None,
         max_budget: float | None = None,
+        target: str | None = None,
     ) -> dict[str, str]:
-        """Start a scan of a project under the projects root; returns its scan_id.
+        """Start a scan and return its scan_id. Pass exactly one of project or target.
 
-        project: bare directory name under the projects root (e.g. "my-app").
+        project: bare directory name under the projects root (e.g. "my-app"),
+            scanned white-box; the name is confined to the root.
+        target: a URL, domain, or IP scanned black-box (e.g.
+            "http://10.0.0.5:8080/"); not confined to the projects root, so the
+            bearer token is the only gate on what it may reach. A local path is
+            refused here -- use project for local code.
         scan_mode: lightning | quick | standard | deep.
         instruction: optional free-text guidance for the agents.
         max_budget: optional USD ceiling (ignored on a $0 subscription backend).
         """
-        return await jobs.start(project, scan_mode, instruction, max_budget)
+        return await jobs.start(project, scan_mode, instruction, max_budget, target)
 
     @mcp.tool()
     def strix_scan_status(scan_id: str) -> dict[str, Any]:

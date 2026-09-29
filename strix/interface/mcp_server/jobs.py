@@ -22,7 +22,11 @@ from strix.core.runner import run_strix_scan
 from strix.interface.cli import _resolve_sandbox_image
 from strix.interface.mcp_server.projects import resolve_project
 from strix.interface.scan_setup import build_targets_info
-from strix.interface.utils import collect_local_sources, generate_run_name
+from strix.interface.utils import (
+    collect_local_sources,
+    generate_run_name,
+    infer_target_type,
+)
 from strix.report.state import ReportState, set_global_report_state
 from strix.report.writer import read_run_record
 
@@ -74,18 +78,43 @@ def _scan_config(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _resolve_target(project: str | None, target: str | None) -> str:
+    """The single target string for the scan: a confined project dir or a URL/host.
+
+    A project is resolved under the confined projects root (path traversal is
+    rejected). A ``target`` is a URL, domain, or IP scanned black-box; it does NOT
+    go through the projects-root confinement, and a filesystem path is refused so
+    a caller cannot reach the host's disk through it -- only the bearer token
+    gates what a client may point the scanner at.
+    """
+    if bool(project) == bool(target):
+        raise JobError("pass exactly one of project or target")
+    if project:
+        return str(resolve_project(project))  # raises ProjectError on a bad name
+    target = (target or "").strip()
+    target_type, _ = infer_target_type(target)  # raises ValueError on an unrecognized target
+    if target_type in {"local_code", "api_spec"}:
+        raise JobError(
+            f"target {target!r} is a local path; scan local code with the project argument, "
+            "which is confined to the projects root"
+        )
+    return target
+
+
 def _prepare(
-    project: str, scan_mode: str, instruction: str | None, max_budget: float | None
+    project: str | None,
+    target: str | None,
+    scan_mode: str,
+    instruction: str | None,
+    max_budget: float | None,
 ) -> tuple[argparse.Namespace, float | None]:
     if scan_mode not in _SCAN_MODES:
         raise JobError(f"unknown scan_mode {scan_mode!r}: expected one of {', '.join(_SCAN_MODES)}")
     if max_budget is not None and max_budget <= 0:
         raise JobError(f"max_budget must be positive, received {max_budget!r}")
 
-    project_dir = resolve_project(project)  # raises ProjectError on a bad name
-
     args = argparse.Namespace(
-        target=[str(project_dir)],
+        target=[_resolve_target(project, target)],
         target_list=[],
         instruction=instruction,
         scan_mode=scan_mode,
@@ -97,13 +126,14 @@ def _prepare(
 
 
 async def start(
-    project: str,
+    project: str | None = None,
     scan_mode: str = "quick",
     instruction: str | None = None,
     max_budget: float | None = None,
+    target: str | None = None,
 ) -> dict[str, str]:
-    """Launch a scan of ``project`` and return its ``scan_id`` without waiting."""
-    args, budget = _prepare(project, scan_mode, instruction, max_budget)
+    """Launch a scan of a project or a URL/host and return its ``scan_id`` at once."""
+    args, budget = _prepare(project, target, scan_mode, instruction, max_budget)
     scan_id = args.run_name
     scan_config = _scan_config(args)
 

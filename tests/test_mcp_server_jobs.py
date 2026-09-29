@@ -66,6 +66,44 @@ def test_start_launches_a_task_and_returns_at_once(
     assert run_json.is_file(), "start() must set up ReportState so run.json is written"
 
 
+def test_url_target_launches_black_box(_project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    launched: dict[str, Any] = {}
+
+    async def _fake_run(**kwargs: Any) -> None:
+        launched.update(kwargs)
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(jobs, "run_strix_scan", _fake_run)
+    monkeypatch.setattr(jobs, "_resolve_sandbox_image", lambda: "img:test")
+
+    async def _go() -> dict[str, str]:
+        result = await jobs.start(target="http://10.1.20.199:49374/web", scan_mode="quick")
+        await jobs._tasks[result["scan_id"]]
+        return result
+
+    result = asyncio.run(_go())
+    assert result["status"] == "started"
+    targets = launched["scan_config"]["targets"]
+    assert targets[0]["type"] == "web_application"
+    assert targets[0]["details"]["target_url"] == "http://10.1.20.199:49374/web"
+    # A URL has no local source to bind-mount.
+    assert launched["local_sources"] == []
+
+
+def test_exactly_one_of_project_or_target(_project: Path) -> None:
+    with pytest.raises(jobs.JobError, match="exactly one of project or target"):
+        asyncio.run(jobs.start())
+    with pytest.raises(jobs.JobError, match="exactly one of project or target"):
+        asyncio.run(jobs.start(project="my-app", target="http://x.test/"))
+
+
+def test_a_local_path_as_target_is_refused(_project: Path) -> None:
+    # A filesystem path must go through `project` (confined to the root); allowing
+    # it via `target` would reach the host's disk outside the confinement.
+    with pytest.raises(jobs.JobError, match="local path"):
+        asyncio.run(jobs.start(target=str(_project)))
+
+
 def test_unknown_scan_mode_is_rejected_before_launch(_project: Path) -> None:
     with pytest.raises(jobs.JobError, match="unknown scan_mode"):
         asyncio.run(jobs.start("my-app", scan_mode="turbo"))
@@ -116,7 +154,7 @@ def test_status_reports_failed_when_the_task_died_before_writing_run_json(
         with contextlib.suppress(RuntimeError):
             await task
         jobs._tasks["scan-died"] = task
-        return jobs.status("scan-died")["status"]
+        return str(jobs.status("scan-died")["status"])
 
     assert asyncio.run(_go()) == "failed"
 
@@ -132,7 +170,7 @@ def test_status_reports_running_only_while_the_task_lives(_project: Path) -> Non
         task = asyncio.create_task(_long())
         await started.wait()
         jobs._tasks["scan-live"] = task
-        state = jobs.status("scan-live")["status"]
+        state = str(jobs.status("scan-live")["status"])
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
