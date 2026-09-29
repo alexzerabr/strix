@@ -23,6 +23,7 @@ from strix.interface.cli import _resolve_sandbox_image
 from strix.interface.mcp_server.projects import resolve_project
 from strix.interface.scan_setup import build_targets_info
 from strix.interface.utils import collect_local_sources, generate_run_name
+from strix.report.state import ReportState, set_global_report_state
 from strix.report.writer import read_run_record
 
 
@@ -108,6 +109,16 @@ async def start(
 
     async def _run() -> None:
         async with _slots():
+            # run_strix_scan reads the report state through get_global_report_state,
+            # so the caller has to build and register it first, exactly as the CLI
+            # does. Without this the scan runs but writes no run.json, so status and
+            # findings stay empty. Set inside the semaphore (one scan at a time), so
+            # the global always belongs to the scan that is actually running.
+            report_state = ReportState(scan_id)
+            report_state.hydrate_from_run_dir()
+            report_state.set_scan_config(scan_config)
+            report_state.save_run_data()
+            set_global_report_state(report_state)
             await run_strix_scan(
                 scan_config=scan_config,
                 scan_id=scan_id,

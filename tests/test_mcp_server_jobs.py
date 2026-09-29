@@ -58,6 +58,12 @@ def test_start_launches_a_task_and_returns_at_once(
     assert launched["scan_config"]["scan_mode"] == "quick"
     assert launched["scan_config"]["non_interactive"] is True
     assert launched["local_sources"], "a local project must produce a bind-mount source"
+    # run_strix_scan reads the report state through the global, so start() must
+    # register one before launching, or the scan writes no run.json and status
+    # stays empty. Proven on the deployment host: without this, a live scan ran
+    # for 10 minutes and never wrote run.json.
+    run_json = _project.parent / "strix_runs" / result["scan_id"] / "run.json"
+    assert run_json.is_file(), "start() must set up ReportState so run.json is written"
 
 
 def test_unknown_scan_mode_is_rejected_before_launch(_project: Path) -> None:
