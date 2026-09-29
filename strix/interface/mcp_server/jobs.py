@@ -34,6 +34,10 @@ logger = logging.getLogger(__name__)
 
 _SCAN_MODES = ("lightning", "quick", "standard", "deep")
 
+# Statuses a scan's run.json reports once it has reached an end; anything else
+# (or a missing run.json) defers to the launched task's own state.
+_TERMINAL_STATUSES = frozenset({"completed", "failed", "crashed", "interrupted"})
+
 _tasks: dict[str, asyncio.Task[Any]] = {}
 _semaphore: asyncio.Semaphore | None = None
 
@@ -142,15 +146,31 @@ def status(scan_id: str) -> dict[str, Any]:
     record = _record(scan_id)
     usage = record.get("llm_usage") or {}
     reported = record.get("status")
-    if not reported:
-        reported = "running" if scan_id in _tasks else "unknown"
+    task_state = _task_state(_tasks.get(scan_id))
+    # A finished task overrides a missing or non-terminal run.json status. A scan
+    # can fail before ReportState writes any run.json (e.g. LLM auth fails at
+    # warm-up), and without this the caller would poll "running" forever on a scan
+    # that already ended.
+    if reported not in _TERMINAL_STATUSES and task_state is not None:
+        reported = task_state
     return {
         "scan_id": scan_id,
-        "status": reported,
+        "status": reported or "unknown",
         "vulnerabilities": len(record.get("vulnerabilities") or []),
         "tokens": usage.get("total_tokens", 0),
         "cost": usage.get("cost", 0.0),
     }
+
+
+def _task_state(task: asyncio.Task[Any] | None) -> str | None:
+    """Status derived from the launched task, or None when none is tracked here."""
+    if task is None:
+        return None
+    if not task.done():
+        return "running"
+    if task.cancelled():
+        return "cancelled"
+    return "failed" if task.exception() is not None else "completed"
 
 
 def findings(scan_id: str) -> list[dict[str, Any]]:

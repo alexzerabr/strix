@@ -4,6 +4,7 @@ and reject bad arguments before anything is launched."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from typing import TYPE_CHECKING, Any
 
@@ -93,6 +94,45 @@ def test_status_reads_from_run_json(_project: Path) -> None:
 
 def test_status_of_an_unknown_id_is_unknown(_project: Path) -> None:
     assert jobs.status("never-started")["status"] == "unknown"
+
+
+def test_status_reports_failed_when_the_task_died_before_writing_run_json(
+    _project: Path,
+) -> None:
+    # A scan can fail before ReportState writes any run.json (LLM auth fails at
+    # warm-up). Reproduced end to end on the remote: the client polled "running"
+    # forever. A finished-with-exception task must read as failed, not running.
+    async def _boom() -> None:
+        raise RuntimeError("OAuth session expired")
+
+    async def _go() -> str:
+        task = asyncio.create_task(_boom())
+        with contextlib.suppress(RuntimeError):
+            await task
+        jobs._tasks["scan-died"] = task
+        return jobs.status("scan-died")["status"]
+
+    assert asyncio.run(_go()) == "failed"
+
+
+def test_status_reports_running_only_while_the_task_lives(_project: Path) -> None:
+    started = asyncio.Event()
+
+    async def _go() -> str:
+        async def _long() -> None:
+            started.set()
+            await asyncio.sleep(5)
+
+        task = asyncio.create_task(_long())
+        await started.wait()
+        jobs._tasks["scan-live"] = task
+        state = jobs.status("scan-live")["status"]
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        return state
+
+    assert asyncio.run(_go()) == "running"
 
 
 def test_findings_projects_the_fields_agents_need(_project: Path) -> None:
