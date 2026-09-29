@@ -1,0 +1,45 @@
+# Self-hosted Strix MCP server (see docs/integrations/mcp-server.md).
+#
+# Runs as a plain process on the Strix host, talking to the host's Docker, so a
+# bind mount of /projects/<name> resolves with no path translation. Install:
+#
+#   sudo cp deploy/strix-mcp.service /etc/systemd/system/
+#   sudo systemctl edit strix-mcp     # set STRIX_MCP_TOKEN to a long random secret
+#   sudo systemctl enable --now strix-mcp
+#
+# The server refuses to start if STRIX_MCP_TOKEN is unset, so it never binds the
+# network unauthenticated.
+
+[Unit]
+Description=Strix MCP server (self-hosted, LAN)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Run as your own user (must be in the docker group) rather than root.
+User=strix
+Group=docker
+
+# WorkingDirectory anchors strix_runs/: the scan writes run.json here and the
+# server reads status back from the same place, so keep it stable.
+WorkingDirectory=/var/lib/strix
+
+Environment=STRIX_LLM=claude-code/claude-opus-5
+Environment=STRIX_PROJECTS_ROOT=/projects
+# Set the bearer secret in an override, not here:
+#   sudo systemctl edit strix-mcp
+#   [Service]
+#   Environment=STRIX_MCP_TOKEN=<long-random-secret>
+
+ExecStart=/usr/local/bin/strix mcp-serve --host 0.0.0.0 --port 8848
+
+Restart=on-failure
+RestartSec=3
+
+# The claude-code subscription backend needs the signed-in ~/.claude of User=.
+# Keep it writable so token refresh persists across restarts.
+ProtectHome=false
+
+[Install]
+WantedBy=multi-user.target

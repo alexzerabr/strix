@@ -536,6 +536,13 @@ def main() -> None:
 
         sys.exit(run_cloud(sys.argv[2:]))
 
+    # `strix mcp-serve …` runs the self-hosted MCP server (a long-lived process,
+    # see deploy/strix-mcp.service); it needs no target or scan argument parsing.
+    if len(sys.argv) > 1 and sys.argv[1] == "mcp-serve":
+        from strix.interface.mcp_server.server import serve
+
+        sys.exit(serve(sys.argv[2:]))
+
     start_import_warmup()
 
     args = parse_arguments()
