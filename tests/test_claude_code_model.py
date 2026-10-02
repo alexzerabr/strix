@@ -459,6 +459,26 @@ def test_semaphore_bounds_concurrency(monkeypatch: pytest.MonkeyPatch) -> None:
     assert peak <= 2
 
 
+def test_default_concurrency_is_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A personal Pro/Max subscription assumes ordinary, individual use, so the
+    # backend runs a single claude -p at a time unless the operator opts into more.
+    monkeypatch.delenv("STRIX_CLAUDE_CODE_MAX_PROCS", raising=False)
+    assert claude_process._DEFAULT_MAX_PROCS == 1
+    assert claude_process._max_procs() == 1
+
+
+def test_max_procs_override_is_honoured(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("STRIX_CLAUDE_CODE_MAX_PROCS", "4")
+    assert claude_process._max_procs() == 4
+
+
+def test_max_procs_rejects_garbage_and_falls_back_to_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STRIX_CLAUDE_CODE_MAX_PROCS", "not-a-number")
+    assert claude_process._max_procs() == claude_process._DEFAULT_MAX_PROCS
+
+
 def test_turn_is_bounded_by_the_callers_request_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     # Every other route honours LLM_TIMEOUT. Without it a wedged turn burns the
     # transport's own generous default and is then retried, so one stuck turn

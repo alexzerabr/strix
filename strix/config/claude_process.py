@@ -41,7 +41,11 @@ from strix.config import claude_bridge, claude_code
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_MAX_PROCS = 8
+# Conservative by default: one ``claude -p`` at a time. A personal Pro/Max
+# subscription assumes ordinary, individual use, and a wide multi-agent graph
+# firing many concurrent CLIs would burn through its usage limits fast. Operators
+# who know their plan's headroom can raise it with ``STRIX_CLAUDE_CODE_MAX_PROCS``.
+_DEFAULT_MAX_PROCS = 1
 # A single agent turn can involve real model latency; bound it generously so a
 # genuinely hung subprocess still cannot wedge the run forever.
 _DEFAULT_TURN_TIMEOUT_S = 900
@@ -140,11 +144,10 @@ def _get_semaphore() -> asyncio.Semaphore:
 
 # The turn blocks a whole thread for its duration, so it gets its own pool rather
 # than asyncio's default executor. That default is sized min(32, cpu_count + 4),
-# which on a 2-core host is six workers against a default of eight concurrent
-# turns: the transport would fill it and stall every other asyncio.to_thread in
-# Strix (the notes, coverage, threat-model and reporting tools, and the TUI
-# sidecar's process wait) behind a model call. Sized to the same bound as the
-# semaphore, so a slot always has a thread waiting for it.
+# and a raised STRIX_CLAUDE_CODE_MAX_PROCS could otherwise fill it and stall every
+# other asyncio.to_thread in Strix (the notes, coverage, threat-model and reporting
+# tools, and the TUI sidecar's process wait) behind a model call. Sized to the same
+# bound as the semaphore, so a slot always has a thread waiting for it.
 _executors: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, tuple[ThreadPoolExecutor, int]] = (
     weakref.WeakKeyDictionary()
 )
