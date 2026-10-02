@@ -614,10 +614,17 @@ func (m Model) viewerView(width int) string {
 // subscriptionLabel names the backend a subscription run is on. Strix has two,
 // and reporting every one of them as ChatGPT mislabels a claude-code/ run.
 func subscriptionLabel(model string) string {
-	if strings.HasPrefix(strings.ToLower(model), "claude-code/") {
+	m := strings.ToLower(model)
+	switch {
+	case strings.HasPrefix(m, "claude-code/"):
 		return "Claude subscription"
+	case strings.HasPrefix(m, "chatgpt/"):
+		return "ChatGPT subscription"
+	default:
+		// Never guess ChatGPT for an unknown/empty model: a subscription run whose
+		// model string didn't survive would otherwise be mislabelled.
+		return "Subscription"
 	}
-	return "ChatGPT subscription"
 }
 
 func (m Model) statsView() string {
