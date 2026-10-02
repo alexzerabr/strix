@@ -24,9 +24,19 @@ unchanged.
 </Warning>
 
 Use it for your own, individual testing. For a supported, unambiguous path — a team, CI,
-or client engagements — use the metered API key (`anthropic/<model>` + `LLM_API_KEY`), or
-Amazon Bedrock / Google Vertex / Microsoft Foundry, none of which rely on a personal
-subscription.
+shared use, or client engagements — use the metered API key (`anthropic/<model>` +
+`LLM_API_KEY`), or Amazon Bedrock / Google Vertex / Microsoft Foundry, none of which rely
+on a personal subscription.
+
+<Warning>
+  **Distributing this fork** so other people run it on their own Claude subscriptions is
+  the case Anthropic's terms most directly steer away from: each person is then a separate
+  operator building a tool on subscription credentials, and each bears their own
+  rate-limit and account risk. For anything beyond one person's individual use, point
+  users at the API-key path (or a Claude Team/Enterprise plan) and keep this mode strictly
+  opt-in. It is opt-in by construction — there is no default `STRIX_LLM`, and the backend
+  engages only on an explicit `claude-code/` model — so leave it that way.
+</Warning>
 
 - **Privacy.** Strix sends target data (source, requests, findings) to the model like any
   other backend. On a consumer (Free/Pro/Max) account, whether that traffic may train
