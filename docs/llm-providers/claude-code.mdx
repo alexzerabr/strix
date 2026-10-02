@@ -44,8 +44,12 @@ on a personal subscription.
   review it before scanning sensitive or client-owned targets, where an engagement NDA may
   forbid it. Strix never reads or stores your Claude credentials, and never puts tokens in
   logs, reports, or telemetry.
-- **Guardrails.** If Claude refuses a step on content grounds, Strix surfaces the refusal
-  and moves on; it does not rephrase-and-retry to get around it.
+- **Guardrails — expect frequent refusals.** Claude's Acceptable Use Policy safeguards
+  flag offensive-security content, so on a real pentest workload Claude will often refuse
+  mid-scan (observed even on a trivial target), which can interrupt the run. Strix
+  surfaces the refusal and stops that turn — it never retries or rephrases to get around a
+  safety block. For effective scanning use a non-Claude model (any of Strix's recommended
+  frontier models); Claude fits lighter, non-offensive analysis.
 - **No silent fallback.** A `claude-code/` run never quietly switches to a billed API key:
   if the subscription is unavailable it stops, or on an API-key session meters openly and
   says so.
