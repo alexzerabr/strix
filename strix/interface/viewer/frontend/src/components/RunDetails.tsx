@@ -105,7 +105,9 @@ export function RunDetails({
   // mislabels a claude-code/ run.
   const subscriptionLabel = models.some((m) => m.toLowerCase().startsWith("claude-code/"))
     ? "Claude subscription"
-    : "ChatGPT subscription";
+    : models.some((m) => m.toLowerCase().startsWith("chatgpt/"))
+      ? "ChatGPT subscription"
+      : "Subscription";
 
   const sub = (n: number, word: string) => (
     <span className="text-[#666]"> ({formatNumber(n)} {word})</span>

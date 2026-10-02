@@ -6,6 +6,7 @@ import asyncio
 import json
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -268,13 +269,23 @@ class _FakeProcess:
     communicate() has returned, so the cleanup kill is a no-op on the happy path.
     """
 
-    def __init__(self, *, running: bool = False, pid: int = 4321) -> None:
+    def __init__(
+        self, *, running: bool = False, pid: int = 4321, ignore_term: bool = False
+    ) -> None:
         self.killed = False
+        self.terminated = False
         self.pid = pid
         self._running = running
+        self._ignore_term = ignore_term
 
     def poll(self) -> int | None:
         return None if self._running else 0
+
+    def terminate(self) -> None:
+        self.terminated = True
+        if not self._ignore_term:
+            self.killed = True
+            self._running = False
 
     def kill(self) -> None:
         self.killed = True
@@ -295,6 +306,35 @@ def test_argv_carries_the_schema_only_for_agent_turns(monkeypatch: pytest.Monkey
     assert "--json-schema" not in claude_process._build_argv(
         "claude-opus-4-8", [], structured=False
     )
+
+
+def test_base_args_lock_the_hardening_contract() -> None:
+    # Claude Code is driven with no tools (Strix runs tools in its own sandbox),
+    # none of the user's settings/MCP/slash-commands, and no persisted session.
+    # Dropping any of these would hand the CLI access to the host it must not have.
+    args = list(claude_process._BASE_ARGS)
+    assert args[args.index("--tools") + 1] == ""
+    assert args[args.index("--setting-sources") + 1] == ""
+    assert "--strict-mcp-config" in args
+    assert "--disable-slash-commands" in args
+    assert "--no-session-persistence" in args
+
+
+def test_argv_never_carries_a_permission_bypass(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(claude_code, "binary_path", lambda: "/usr/bin/claude")
+    argv = claude_process._build_argv("claude-opus-4-8", [])
+    for danger in ("--dangerously-skip-permissions", "bypassPermissions", "--permission-mode"):
+        assert danger not in argv
+
+
+def test_model_slug_cannot_inject_cli_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A hostile STRIX_LLM (claude-code/<slug>) must not smuggle flags. With an argv
+    # list and no shell, the whole slug stays a single --model value.
+    monkeypatch.setattr(claude_code, "binary_path", lambda: "/usr/bin/claude")
+    malicious = "claude-opus-4-8 --dangerously-skip-permissions"
+    argv = claude_process._build_argv(malicious, [])
+    assert argv[argv.index("--model") + 1] == malicious
+    assert "--dangerously-skip-permissions" not in argv
 
 
 def test_toolless_turn_requests_an_unstructured_reply(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -459,6 +499,45 @@ def test_semaphore_bounds_concurrency(monkeypatch: pytest.MonkeyPatch) -> None:
     assert peak <= 2
 
 
+def test_default_concurrency_is_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A personal Pro/Max subscription assumes ordinary, individual use, so the
+    # backend runs a single claude -p at a time unless the operator opts into more.
+    monkeypatch.delenv("STRIX_CLAUDE_CODE_MAX_PROCS", raising=False)
+    assert claude_process._DEFAULT_MAX_PROCS == 1
+    assert claude_process._max_procs() == 1
+
+
+def test_max_procs_override_is_honoured(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("STRIX_CLAUDE_CODE_MAX_PROCS", "4")
+    assert claude_process._max_procs() == 4
+
+
+def test_max_procs_rejects_garbage_and_falls_back_to_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STRIX_CLAUDE_CODE_MAX_PROCS", "not-a-number")
+    assert claude_process._max_procs() == claude_process._DEFAULT_MAX_PROCS
+
+
+def test_child_env_pins_claude_code_internal_retries_to_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Strix is the single retry layer; the child must not stack Claude Code's own
+    # internal retries underneath it, whatever the operator set.
+    monkeypatch.setenv("CLAUDE_CODE_MAX_RETRIES", "12")
+    monkeypatch.setenv("CLAUDE_CODE_RETRY_WATCHDOG", "1")
+    env = claude_process._child_env()
+    assert env["CLAUDE_CODE_MAX_RETRIES"] == "0"
+
+
+def test_child_env_inherits_the_rest_of_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STRIX_CHILD_ENV_PROBE", "inherited")
+    env = claude_process._child_env()
+    assert env.get("STRIX_CHILD_ENV_PROBE") == "inherited"
+
+
 def test_turn_is_bounded_by_the_callers_request_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     # Every other route honours LLM_TIMEOUT. Without it a wedged turn burns the
     # transport's own generous default and is then retried, so one stuck turn
@@ -596,7 +675,11 @@ def test_windows_kill_takes_the_whole_process_tree(monkeypatch: pytest.MonkeyPat
     assert process.killed is True
 
 
-def test_posix_kill_does_not_shell_out(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_posix_kill_terminates_gracefully_without_shelling_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # SIGTERM first (process.terminate) so claude can close its connection; never a
+    # taskkill/shell on POSIX. The child exits on SIGTERM, so no SIGKILL is needed.
     calls: list[list[str]] = []
 
     def _run(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[bytes]:
@@ -608,7 +691,22 @@ def test_posix_kill_does_not_shell_out(monkeypatch: pytest.MonkeyPatch) -> None:
     process = _FakeProcess(running=True)
     claude_process._kill_if_running(cast("subprocess.Popen[str]", process))
     assert calls == []
+    assert process.terminated is True
+    assert process.poll() == 0
+
+
+def test_posix_kill_escalates_to_sigkill_when_sigterm_is_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A child that ignores SIGTERM is SIGKILLed after the grace window, so an
+    # abandoned turn can never outlive its semaphore slot.
+    monkeypatch.setattr(claude_process, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(claude_process, "_KILL_GRACE_S", 0.1)
+    process = _FakeProcess(running=True, ignore_term=True)
+    claude_process._kill_if_running(cast("subprocess.Popen[str]", process))
+    assert process.terminated is True
     assert process.killed is True
+    assert process.poll() == 0
 
 
 def test_stdin_payload_is_one_line_whatever_the_prompt_contains() -> None:
@@ -622,6 +720,94 @@ def test_stdin_payload_is_one_line_whatever_the_prompt_contains() -> None:
     assert encoded.isascii()
     rendered = json.loads(encoded)["message"]["content"][0]["text"]
     assert text in rendered
+
+
+def test_communicate_streams_and_keeps_only_the_result_line() -> None:
+    # The real transport (the tests above fake it): stdout is streamed and only the
+    # terminal result line survives; the prompt reaches the child over stdin.
+    script = """
+import sys
+sys.stdout.write('{"type":"system","subtype":"init"}\\n')
+sys.stdout.write('not json diagnostic noise\\n')
+sys.stdout.write('{"type":"result","is_error":false,"result":"{}"}\\n')
+sys.stdout.flush()
+sys.stderr.write('got stdin: ' + sys.stdin.read())
+"""
+    process = claude_process._spawn([sys.executable, "-c", script])
+    completed = claude_process._communicate(process, "PROMPT-123\n", timeout=30.0)
+    assert completed.returncode == 0
+    assert '"type":"result"' in completed.stdout
+    assert "init" not in completed.stdout
+    assert "diagnostic noise" not in completed.stdout
+    assert "PROMPT-123" in completed.stderr  # the prompt was delivered over stdin
+    assert claude_bridge.parse_transcript(completed.stdout.split("\n"))["type"] == "result"
+
+
+def test_communicate_raises_when_stdout_exceeds_the_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(claude_process, "_MAX_STDOUT_CHARS", 200)
+    script = """
+import sys, time
+for _ in range(100000):
+    sys.stdout.write('x' * 80 + '\\n')
+sys.stdout.flush()
+time.sleep(5)
+"""
+    process = claude_process._spawn([sys.executable, "-c", script])
+    with pytest.raises(claude_code.ClaudeCodeError, match="characters of output") as exc:
+        claude_process._communicate(process, "x", timeout=30.0)
+    # Deterministic overflow must not be retried (a retry reproduces it + burns quota).
+    assert claude_code.is_permanent_error(exc.value)
+
+
+def test_communicate_keeps_only_a_bounded_stderr_tail(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(claude_process, "_MAX_STDERR_CHARS", 200)
+    script = """
+import sys
+sys.stdout.write('{"type":"result","is_error":false,"result":"{}"}\\n')
+sys.stdout.flush()
+for i in range(500):
+    sys.stderr.write('E%04d\\n' % i)
+sys.stderr.flush()
+sys.stdin.read()
+"""
+    process = claude_process._spawn([sys.executable, "-c", script])
+    completed = claude_process._communicate(process, "x", timeout=30.0)
+    assert completed.returncode == 0
+    assert len(completed.stderr) <= 200 + 16  # bounded tail, one line of slack
+    assert "E0499" in completed.stderr  # keeps the tail
+    assert "E0000" not in completed.stderr  # drops the head
+
+
+def test_turn_output_stderr_is_thread_safe() -> None:
+    # A bounded worker.join() can return while a stderr pump is still draining; reading
+    # the tail must not raise "RuntimeError: deque mutated during iteration".
+    out = claude_process._TurnOutput(cast("subprocess.Popen[str]", _FakeProcess()))
+    stop = threading.Event()
+
+    def _writer() -> None:
+        while not stop.is_set():
+            out.on_stderr("noise\n")
+
+    writer = threading.Thread(target=_writer, daemon=True)
+    writer.start()
+    try:
+        for _ in range(3000):
+            _ = out.stderr  # must not raise while the writer mutates the deque
+    finally:
+        stop.set()
+        writer.join(2)
+
+
+def test_kill_with_zero_grace_does_not_busy_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The cancellation path kills with grace=0 so it never stalls the event loop; even a
+    # child that ignores SIGTERM is SIGKILLed immediately, with no grace-window sleep.
+    monkeypatch.setattr(claude_process, "sys", SimpleNamespace(platform="linux"))
+    process = _FakeProcess(running=True, ignore_term=True)
+    start = time.monotonic()
+    claude_process._kill_if_running(cast("subprocess.Popen[str]", process), grace=0.0)
+    assert time.monotonic() - start < 0.5
+    assert process.terminated is True
+    assert process.killed is True
 
 
 def test_request_timeout_ignores_a_non_numeric_or_boolean_value() -> None:
