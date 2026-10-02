@@ -519,16 +519,14 @@ def _error_status(result: dict[str, Any]) -> int | None:
     if isinstance(explicit, int):
         return explicit
     haystack = f"{result.get('result', '')} {result.get('subtype', '')}".lower()
-    if any(marker in haystack for marker in _ENTITLEMENT_MARKERS):
-        # 403, so the run stops instead of retrying. These arrive with no
-        # api_error_status, and an untagged error hits the statusless fallback --
-        # five attempts with 2s..90s backoff, per turn, per agent, for something
-        # a second attempt cannot clear.
-        return 403
-    if any(marker in haystack for marker in _USAGE_LIMIT_MARKERS):
-        # Also 403 (terminal): a windowed plan cap will not clear inside a retry
-        # burst, so stop and let the operator resume after the reset rather than
-        # burn attempts (and, under CLAUDE_CODE_RETRY_WATCHDOG, hours of backoff).
+    if any(marker in haystack for marker in _ENTITLEMENT_MARKERS) or any(
+        marker in haystack for marker in _USAGE_LIMIT_MARKERS
+    ):
+        # Terminal (403), so the run stops instead of retrying: the account cannot run
+        # inference at all (entitlement) or has hit a windowed plan cap a retry burst
+        # cannot clear before it resets. Both arrive with no api_error_status and would
+        # otherwise hit the statusless fallback -- five attempts with 2s..90s backoff,
+        # per turn, per agent, for something a second attempt cannot clear.
         return 403
     if "429" in haystack or "rate limit" in haystack or "rate_limit" in haystack:
         return 429
