@@ -482,17 +482,19 @@ _ENTITLEMENT_MARKERS = (
 )
 
 
-# A Pro/Max plan usage cap for the current window ("You've hit your session/weekly/
-# Opus limit - resets ..."). It clears only when the window resets, not within a
-# retry burst, so it is treated as terminal: the run stops and surfaces the CLI's
-# own message (with the reset time) instead of spending attempts that cannot help.
+# A Pro/Max plan usage cap ("you've hit your session/weekly/Opus limit", "usage limit
+# reached", "monthly spend limit", ...). Matched on substrings specific to plan caps and
+# robust to word order, but deliberately NOT bare "limit"/"limit reached": those also
+# match a context-length error, which must route to compaction (400), not here. A cap
+# clears only when its window resets, not within a retry burst, so it is terminal: the run
+# stops and surfaces the CLI's own message (with the reset) instead of burning attempts.
 _USAGE_LIMIT_MARKERS = (
-    "hit your session limit",
-    "hit your weekly limit",
-    "hit your opus limit",
-    "hit your monthly spend limit",
-    "hit your usage limit",
-    "reached your usage limit",
+    "usage limit",
+    "session limit",
+    "weekly limit",
+    "opus limit",
+    "sonnet limit",
+    "monthly spend limit",
 )
 
 

@@ -468,6 +468,11 @@ def test_invalid_model_transcript_is_classified_and_surfaced() -> None:
         ({"result": "You've hit your session limit · resets 3:45pm"}, 403),
         ({"result": "You've hit your weekly limit · resets Mon 12:00am"}, 403),
         ({"result": "You've hit your Opus limit · resets 3:45pm"}, 403),
+        # Robust to word order / alternative phrasings:
+        ({"result": "Weekly usage limit reached. Resets Monday."}, 403),
+        ({"result": "You have reached your session limit."}, 403),
+        # Must NOT be mistaken for a cap: a context-length error still routes to 400.
+        ({"result": "API Error: the input is too long for the context window"}, 400),
         ({"result": "something else entirely"}, None),
         # bool is an int subclass, and True is not a status code.
         ({"api_error_status": True, "result": "API Error: Overloaded"}, 529),
