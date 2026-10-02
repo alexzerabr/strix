@@ -753,8 +753,10 @@ sys.stdout.flush()
 time.sleep(5)
 """
     process = claude_process._spawn([sys.executable, "-c", script])
-    with pytest.raises(claude_code.ClaudeCodeError, match="characters of output"):
+    with pytest.raises(claude_code.ClaudeCodeError, match="characters of output") as exc:
         claude_process._communicate(process, "x", timeout=30.0)
+    # Deterministic overflow must not be retried (a retry reproduces it + burns quota).
+    assert claude_code.is_permanent_error(exc.value)
 
 
 def test_communicate_keeps_only_a_bounded_stderr_tail(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -774,6 +776,38 @@ sys.stdin.read()
     assert len(completed.stderr) <= 200 + 16  # bounded tail, one line of slack
     assert "E0499" in completed.stderr  # keeps the tail
     assert "E0000" not in completed.stderr  # drops the head
+
+
+def test_turn_output_stderr_is_thread_safe() -> None:
+    # A bounded worker.join() can return while a stderr pump is still draining; reading
+    # the tail must not raise "RuntimeError: deque mutated during iteration".
+    out = claude_process._TurnOutput(cast("subprocess.Popen[str]", _FakeProcess()))
+    stop = threading.Event()
+
+    def _writer() -> None:
+        while not stop.is_set():
+            out.on_stderr("noise\n")
+
+    writer = threading.Thread(target=_writer, daemon=True)
+    writer.start()
+    try:
+        for _ in range(3000):
+            _ = out.stderr  # must not raise while the writer mutates the deque
+    finally:
+        stop.set()
+        writer.join(2)
+
+
+def test_kill_with_zero_grace_does_not_busy_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The cancellation path kills with grace=0 so it never stalls the event loop; even a
+    # child that ignores SIGTERM is SIGKILLed immediately, with no grace-window sleep.
+    monkeypatch.setattr(claude_process, "sys", SimpleNamespace(platform="linux"))
+    process = _FakeProcess(running=True, ignore_term=True)
+    start = time.monotonic()
+    claude_process._kill_if_running(cast("subprocess.Popen[str]", process), grace=0.0)
+    assert time.monotonic() - start < 0.5
+    assert process.terminated is True
+    assert process.killed is True
 
 
 def test_request_timeout_ignores_a_non_numeric_or_boolean_value() -> None:

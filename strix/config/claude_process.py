@@ -247,11 +247,13 @@ def _kill_windows_tree(pid: int) -> None:
         )
 
 
-def _kill_if_running(process: subprocess.Popen[str]) -> None:
+def _kill_if_running(process: subprocess.Popen[str], *, grace: float = _KILL_GRACE_S) -> None:
     """Stop the child unless it has already exited.
 
     POSIX: SIGTERM first so ``claude`` can abort its in-flight request and close the
-    connection cleanly, then SIGKILL if it has not exited within ``_KILL_GRACE_S``.
+    connection cleanly, then SIGKILL if it has not exited within ``grace`` seconds.
+    ``grace=0`` is a prompt SIGTERM+SIGKILL with no busy-wait, used on the event-loop
+    thread (``_execute``'s cancellation path) where a wait would stall the whole loop.
     Windows: ``taskkill /T`` reaps the whole tree (the npm shim is cmd.exe, whose node
     grandchild holds the pipes). The kill runs to completion before the semaphore slot
     is released, so an abandoned turn cannot outlive its slot.
@@ -265,7 +267,7 @@ def _kill_if_running(process: subprocess.Popen[str]) -> None:
         return
     with contextlib.suppress(OSError):
         process.terminate()
-    deadline = time.monotonic() + _KILL_GRACE_S
+    deadline = time.monotonic() + grace
     while process.poll() is None and time.monotonic() < deadline:
         time.sleep(0.05)
     if process.poll() is None:
@@ -288,6 +290,7 @@ class _TurnOutput:
         self.overflowed = False
         self._stderr_tail: deque[str] = deque()
         self._stderr_chars = 0
+        self._stderr_lock = threading.Lock()
 
     def on_stdout(self, line: str) -> None:
         if self.overflowed:
@@ -309,14 +312,18 @@ class _TurnOutput:
             self.result_line = line
 
     def on_stderr(self, line: str) -> None:
-        self._stderr_tail.append(line)
-        self._stderr_chars += len(line)
-        while self._stderr_chars > _MAX_STDERR_CHARS and len(self._stderr_tail) > 1:
-            self._stderr_chars -= len(self._stderr_tail.popleft())
+        # Locked against the stderr property: a bounded worker.join() can return while
+        # this pump thread is still draining, and "".join over a mutating deque raises.
+        with self._stderr_lock:
+            self._stderr_tail.append(line)
+            self._stderr_chars += len(line)
+            while self._stderr_chars > _MAX_STDERR_CHARS and len(self._stderr_tail) > 1:
+                self._stderr_chars -= len(self._stderr_tail.popleft())
 
     @property
     def stderr(self) -> str:
-        return "".join(self._stderr_tail)
+        with self._stderr_lock:
+            return "".join(self._stderr_tail)
 
 
 def _pump(stream: Any, sink: Callable[[str], None]) -> None:
@@ -375,8 +382,11 @@ def _communicate(
         worker.join(_KILL_TIMEOUT_S)
 
     if out.overflowed:
+        # Not retryable: an oversized turn is deterministic, so a retry streams the same
+        # output and overflows again, burning subscription quota for nothing.
         raise claude_code.ClaudeCodeError(
-            f"claude -p produced over {_MAX_STDOUT_CHARS} characters of output"
+            f"claude -p produced over {_MAX_STDOUT_CHARS} characters of output",
+            retryable=False,
         )
     return subprocess.CompletedProcess(
         args=process.args, returncode=returncode, stdout=out.result_line, stderr=out.stderr
@@ -413,8 +423,11 @@ async def _execute(
             # keeps running for the rest of the turn timeout, still spending
             # subscription quota, and real concurrency can exceed
             # STRIX_CLAUDE_CODE_MAX_PROCS exactly when turns are being abandoned.
-            # Killing it also lets the stranded worker thread finish.
-            _kill_if_running(process)
+            # Killing it also lets the stranded worker thread finish. grace=0 keeps this
+            # off the loop's critical path: this finally runs inline on the event-loop
+            # thread during cancellation, so a busy-wait here would freeze every other
+            # turn; a prompt SIGTERM+SIGKILL still reaps the child before the slot frees.
+            _kill_if_running(process, grace=0.0)
 
 
 def _decode_transcript(completed: subprocess.CompletedProcess[str]) -> dict[str, Any]:
