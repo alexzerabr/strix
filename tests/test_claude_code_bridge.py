@@ -473,6 +473,16 @@ def test_invalid_model_transcript_is_classified_and_surfaced() -> None:
         ({"result": "You have reached your session limit."}, 403),
         # Must NOT be mistaken for a cap: a context-length error still routes to 400.
         ({"result": "API Error: the input is too long for the context window"}, 400),
+        # A model content-safeguard refusal is terminal (403), never retried.
+        (
+            {
+                "result": (
+                    "API Error: Sonnet 5.5's safeguards flagged this message "
+                    "(https://www.anthropic.com/legal/aup). Claude Code can't respond."
+                )
+            },
+            403,
+        ),
         ({"result": "something else entirely"}, None),
         # bool is an int subclass, and True is not a status code.
         ({"api_error_status": True, "result": "API Error: Overloaded"}, 529),

@@ -498,6 +498,18 @@ _USAGE_LIMIT_MARKERS = (
 )
 
 
+# A content safeguard refusal from the model ("... safeguards flagged this message", a
+# pointer to the AUP, a cybersecurity-risk flag). Retrying a blocked request would burn
+# quota and is exactly the "never auto-retry a guardrailed request, never try to get
+# around a safety block" rule this backend must honour, so it is terminal, not retried.
+_GUARDRAIL_MARKERS = (
+    "safeguards flagged",
+    "legal/aup",
+    "flagged as a possible cybersecurity risk",
+    "flagged for possible cybersecurity risk",
+)
+
+
 # A context overflow the CLI reports without a status. Left untagged it reaches
 # the statusless-retry fallback, which spends five full-context turns on it
 # before the runner ever gets to compact and retry, which is the only thing that
@@ -521,14 +533,17 @@ def _error_status(result: dict[str, Any]) -> int | None:
     if isinstance(explicit, int):
         return explicit
     haystack = f"{result.get('result', '')} {result.get('subtype', '')}".lower()
-    if any(marker in haystack for marker in _ENTITLEMENT_MARKERS) or any(
-        marker in haystack for marker in _USAGE_LIMIT_MARKERS
+    if (
+        any(marker in haystack for marker in _ENTITLEMENT_MARKERS)
+        or any(marker in haystack for marker in _USAGE_LIMIT_MARKERS)
+        or any(marker in haystack for marker in _GUARDRAIL_MARKERS)
     ):
-        # Terminal (403), so the run stops instead of retrying: the account cannot run
-        # inference at all (entitlement) or has hit a windowed plan cap a retry burst
-        # cannot clear before it resets. Both arrive with no api_error_status and would
-        # otherwise hit the statusless fallback -- five attempts with 2s..90s backoff,
-        # per turn, per agent, for something a second attempt cannot clear.
+        # Terminal (403): the run stops instead of retrying. The account cannot run
+        # inference at all (entitlement), has hit a windowed plan cap a retry burst
+        # cannot clear, or the model's safeguards refused the content. Retrying a
+        # safeguard refusal would burn quota and amounts to re-sending a blocked request,
+        # which this backend must never do. These arrive with no api_error_status and
+        # would otherwise hit the statusless retry fallback.
         return 403
     if "429" in haystack or "rate limit" in haystack or "rate_limit" in haystack:
         return 429
