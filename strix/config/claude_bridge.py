@@ -482,6 +482,20 @@ _ENTITLEMENT_MARKERS = (
 )
 
 
+# A Pro/Max plan usage cap for the current window ("You've hit your session/weekly/
+# Opus limit - resets ..."). It clears only when the window resets, not within a
+# retry burst, so it is treated as terminal: the run stops and surfaces the CLI's
+# own message (with the reset time) instead of spending attempts that cannot help.
+_USAGE_LIMIT_MARKERS = (
+    "hit your session limit",
+    "hit your weekly limit",
+    "hit your opus limit",
+    "hit your monthly spend limit",
+    "hit your usage limit",
+    "reached your usage limit",
+)
+
+
 # A context overflow the CLI reports without a status. Left untagged it reaches
 # the statusless-retry fallback, which spends five full-context turns on it
 # before the runner ever gets to compact and retry, which is the only thing that
@@ -510,6 +524,11 @@ def _error_status(result: dict[str, Any]) -> int | None:
         # api_error_status, and an untagged error hits the statusless fallback --
         # five attempts with 2s..90s backoff, per turn, per agent, for something
         # a second attempt cannot clear.
+        return 403
+    if any(marker in haystack for marker in _USAGE_LIMIT_MARKERS):
+        # Also 403 (terminal): a windowed plan cap will not clear inside a retry
+        # burst, so stop and let the operator resume after the reset rather than
+        # burn attempts (and, under CLAUDE_CODE_RETRY_WATCHDOG, hours of backoff).
         return 403
     if "429" in haystack or "rate limit" in haystack or "rate_limit" in haystack:
         return 429

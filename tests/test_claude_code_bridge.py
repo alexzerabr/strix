@@ -464,6 +464,10 @@ def test_invalid_model_transcript_is_classified_and_surfaced() -> None:
             {"result": "Your organization has disabled Claude subscription access for Claude Code"},
             403,
         ),
+        # Windowed Pro/Max usage caps are terminal (403), not retryable 429s.
+        ({"result": "You've hit your session limit · resets 3:45pm"}, 403),
+        ({"result": "You've hit your weekly limit · resets Mon 12:00am"}, 403),
+        ({"result": "You've hit your Opus limit · resets 3:45pm"}, 403),
         ({"result": "something else entirely"}, None),
         # bool is an int subclass, and True is not a status code.
         ({"api_error_status": True, "result": "API Error: Overloaded"}, 529),
@@ -472,3 +476,14 @@ def test_invalid_model_transcript_is_classified_and_surfaced() -> None:
 )
 def test_error_status_classification(result: dict[str, Any], expected: int | None) -> None:
     assert claude_bridge._error_status(result) == expected
+
+
+def test_usage_cap_raises_terminal_error_with_reset_message() -> None:
+    # A windowed plan cap stops the run (non-retryable 403) and shows the operator
+    # the CLI's own message, reset time included, rather than a generic error after
+    # a pointless retry burst.
+    result = {"is_error": True, "result": "You've hit your weekly limit · resets Mon 12:00am"}
+    with pytest.raises(claude_bridge.ClaudeStreamError) as exc:
+        claude_bridge.decode_result(result)
+    assert exc.value.status_code == 403
+    assert "resets Mon 12:00am" in str(exc.value)
