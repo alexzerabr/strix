@@ -479,6 +479,25 @@ def test_max_procs_rejects_garbage_and_falls_back_to_default(
     assert claude_process._max_procs() == claude_process._DEFAULT_MAX_PROCS
 
 
+def test_child_env_pins_claude_code_internal_retries_to_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Strix is the single retry layer; the child must not stack Claude Code's own
+    # internal retries underneath it, whatever the operator set.
+    monkeypatch.setenv("CLAUDE_CODE_MAX_RETRIES", "12")
+    monkeypatch.setenv("CLAUDE_CODE_RETRY_WATCHDOG", "1")
+    env = claude_process._child_env()
+    assert env["CLAUDE_CODE_MAX_RETRIES"] == "0"
+
+
+def test_child_env_inherits_the_rest_of_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STRIX_CHILD_ENV_PROBE", "inherited")
+    env = claude_process._child_env()
+    assert env.get("STRIX_CHILD_ENV_PROBE") == "inherited"
+
+
 def test_turn_is_bounded_by_the_callers_request_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     # Every other route honours LLM_TIMEOUT. Without it a wedged turn burns the
     # transport's own generous default and is then retried, so one stuck turn

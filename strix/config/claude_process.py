@@ -184,6 +184,21 @@ def _build_argv(slug: str, extra_args: list[str], *, structured: bool = True) ->
     return [*argv, *extra_args]
 
 
+def _child_env() -> dict[str, str]:
+    """Environment for the ``claude -p`` child.
+
+    Claude Code retries API errors itself (default 10, up to 15; indefinitely under
+    ``CLAUDE_CODE_RETRY_WATCHDOG``), and Strix's own model-retry policy already wraps
+    the turn. Left stacked, one logical failure could be retried dozens of times and
+    burn subscription usage, so pin the child to zero internal retries and let Strix
+    be the single retry layer. Everything else is inherited unchanged, so the CLI
+    still resolves its own sign-in and configuration.
+    """
+    env = dict(os.environ)
+    env["CLAUDE_CODE_MAX_RETRIES"] = "0"
+    return env
+
+
 def _spawn(argv: list[str]) -> subprocess.Popen[str]:
     return subprocess.Popen(  # noqa: S603  # trusted binary, fixed argv, no shell
         argv,
@@ -193,6 +208,7 @@ def _spawn(argv: list[str]) -> subprocess.Popen[str]:
         text=True,
         encoding="utf-8",
         errors="replace",
+        env=_child_env(),
     )
 
 
