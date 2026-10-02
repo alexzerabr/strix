@@ -297,6 +297,35 @@ def test_argv_carries_the_schema_only_for_agent_turns(monkeypatch: pytest.Monkey
     )
 
 
+def test_base_args_lock_the_hardening_contract() -> None:
+    # Claude Code is driven with no tools (Strix runs tools in its own sandbox),
+    # none of the user's settings/MCP/slash-commands, and no persisted session.
+    # Dropping any of these would hand the CLI access to the host it must not have.
+    args = list(claude_process._BASE_ARGS)
+    assert args[args.index("--tools") + 1] == ""
+    assert args[args.index("--setting-sources") + 1] == ""
+    assert "--strict-mcp-config" in args
+    assert "--disable-slash-commands" in args
+    assert "--no-session-persistence" in args
+
+
+def test_argv_never_carries_a_permission_bypass(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(claude_code, "binary_path", lambda: "/usr/bin/claude")
+    argv = claude_process._build_argv("claude-opus-4-8", [])
+    for danger in ("--dangerously-skip-permissions", "bypassPermissions", "--permission-mode"):
+        assert danger not in argv
+
+
+def test_model_slug_cannot_inject_cli_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A hostile STRIX_LLM (claude-code/<slug>) must not smuggle flags. With an argv
+    # list and no shell, the whole slug stays a single --model value.
+    monkeypatch.setattr(claude_code, "binary_path", lambda: "/usr/bin/claude")
+    malicious = "claude-opus-4-8 --dangerously-skip-permissions"
+    argv = claude_process._build_argv(malicious, [])
+    assert argv[argv.index("--model") + 1] == malicious
+    assert "--dangerously-skip-permissions" not in argv
+
+
 def test_toolless_turn_requests_an_unstructured_reply(monkeypatch: pytest.MonkeyPatch) -> None:
     # tools=[] means a one-shot completion (dedupe, preflight): the caller parses
     # the reply itself, so the envelope must not be forced onto it.
