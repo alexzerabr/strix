@@ -301,6 +301,11 @@ def _login_claude(console: Console) -> int:
         "[green]Signed in with Claude.[/] Set [cyan]STRIX_LLM[/] to a "
         "[cyan]claude-code/[/] model, e.g. [cyan]claude-code/claude-opus-5[/]."
     )
+    console.print(
+        "[dim]Note: driving an automated tool with a personal subscription is at your own "
+        "account risk (rate limits, Terms of Service); an API key is the supported path. "
+        "See docs/llm-providers/claude-code.[/]"
+    )
     return 0
 
 

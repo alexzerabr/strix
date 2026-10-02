@@ -11,6 +11,37 @@ Strix never reads or stores your Claude credentials.
 This is additive: the metered API-key path (`anthropic/<model>` + `LLM_API_KEY`) is
 unchanged.
 
+## Terms, risk, and privacy
+
+<Warning>
+  This backend uses a **personal** Claude subscription to power an automated tool.
+  Anthropic's documentation says subscription (OAuth) access is intended for ordinary,
+  individual use of Claude Code and Anthropic's own apps, and that products built on
+  Claude should authenticate with an **API key**. Running Strix on your subscription
+  therefore sits in a grey area: it is your account and your decision, and it carries a
+  real risk of rate-limiting or account action that no setting removes. Zero risk cannot
+  be guaranteed.
+</Warning>
+
+Use it for your own, individual testing. For a supported, unambiguous path — a team, CI,
+or client engagements — use the metered API key (`anthropic/<model>` + `LLM_API_KEY`), or
+Amazon Bedrock / Google Vertex / Microsoft Foundry, none of which rely on a personal
+subscription.
+
+- **Privacy.** Strix sends target data (source, requests, findings) to the model like any
+  other backend. On a consumer (Free/Pro/Max) account, whether that traffic may train
+  Anthropic's models is governed by your own Claude data-privacy setting, not by Strix —
+  review it before scanning sensitive or client-owned targets, where an engagement NDA may
+  forbid it. Strix never reads or stores your Claude credentials, and never puts tokens in
+  logs, reports, or telemetry.
+- **Guardrails.** If Claude refuses a step on content grounds, Strix surfaces the refusal
+  and moves on; it does not rephrase-and-retry to get around it.
+- **No silent fallback.** A `claude-code/` run never quietly switches to a billed API key:
+  if the subscription is unavailable it stops, or on an API-key session meters openly and
+  says so.
+- **Removing it.** Stop using the `claude-code/` prefix — there is nothing to uninstall.
+  `strix auth logout claude` signs the `claude` CLI out globally.
+
 ## Setup
 
 ```bash
@@ -82,17 +113,18 @@ exactly as a metered provider would. An API-key run is never reported as `$0`.
 
 ## Concurrency and rate limits
 
-Strix runs multiple agents in parallel, and a parallel multi-agent pentest is exactly the
-bursty workload subscription plans throttle. Expect `429`s; Strix retries them with backoff,
-and retries Anthropic's `529` overload too.
+A parallel multi-agent pentest is exactly the bursty workload subscription plans throttle,
+so this backend is **conservative by default: one `claude -p` at a time**
+(`STRIX_CLAUDE_CODE_MAX_PROCS`, default `1`). Raise it only if you know your plan's
+headroom; on **Pro**, prefer a quick scan.
 
-- **Max 20x** is realistically the floor for multi-agent runs.
-- On **Pro**, prefer a quick scan with fewer agents.
-- `STRIX_CLAUDE_CODE_MAX_PROCS` (default `8`) bounds how many `claude` subprocesses run at
-  once.
+- Strix is the **single retry layer**: the child runs with `CLAUDE_CODE_MAX_RETRIES=0`, so
+  Claude Code's own internal retries do not stack on top of Strix's backoff.
+- Transient `429`/`529` are retried with backoff. A **plan usage cap** ("you've hit your
+  session/weekly/Opus limit — resets …") is treated as terminal: Strix stops and shows the
+  reset rather than burning retries that cannot clear it before the window resets.
 - `STRIX_CLAUDE_CODE_TIMEOUT` overrides the per-turn subprocess timeout in seconds. Left
-  unset, a turn is bounded by `LLM_TIMEOUT` (default 300s), and a generous 900s ceiling
-  backstops a turn nothing else bounded.
+  unset, a turn is bounded by `LLM_TIMEOUT` (default 300s), with a 900s ceiling backstop.
 
 ## Reasoning effort
 
