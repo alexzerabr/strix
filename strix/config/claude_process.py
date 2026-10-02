@@ -32,12 +32,18 @@ import os
 import shutil
 import subprocess  # we invoke a trusted, user-installed CLI, never a shell
 import sys
+import threading
 import time
 import weakref
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 from strix.config import claude_bridge, claude_code
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 logger = logging.getLogger(__name__)
@@ -55,6 +61,11 @@ _KILL_TIMEOUT_S = 10
 # After SIGTERM, how long to let claude abort its in-flight request and exit before
 # escalating to SIGKILL. Short, so a cancelled or timed-out turn frees its slot fast.
 _KILL_GRACE_S = 2.0
+# stdout is streamed and only the terminal result event is kept, so memory does not
+# scale with a verbose transcript. These bound the pathological cases: a child that
+# never stops writing, and a flood of stderr. Counted in characters (text pipes).
+_MAX_STDOUT_CHARS = 64 * 1024 * 1024
+_MAX_STDERR_CHARS = 64 * 1024
 # taskkill either reaps the tree at once or not at all. This runs inline on the
 # event loop, deliberately: the semaphore slot must not be released while the
 # child is still alive, which is the leak the kill exists to prevent. Kept short
@@ -262,22 +273,113 @@ def _kill_if_running(process: subprocess.Popen[str]) -> None:
             process.kill()
 
 
+class _TurnOutput:
+    """Collects one turn's streamed output, bounded to the result line + a stderr tail.
+
+    A verbose transcript can be large, but the decoder only wants the terminal
+    ``result`` event, so stdout is reduced to the last ``result`` line as it streams and
+    stderr is kept as a bounded tail. ``overflowed`` trips if stdout blows past the cap.
+    """
+
+    def __init__(self, process: subprocess.Popen[str]) -> None:
+        self._process = process
+        self.result_line = ""
+        self.stdout_chars = 0
+        self.overflowed = False
+        self._stderr_tail: deque[str] = deque()
+        self._stderr_chars = 0
+
+    def on_stdout(self, line: str) -> None:
+        if self.overflowed:
+            return
+        self.stdout_chars += len(line)
+        if self.stdout_chars > _MAX_STDOUT_CHARS:
+            self.overflowed = True
+            _kill_if_running(self._process)
+            return
+        stripped = line.strip()
+        if not stripped:
+            return
+        try:
+            event = json.loads(stripped)
+        except json.JSONDecodeError:
+            return
+        # Keep the raw line; the decoder re-parses it with the same line rules.
+        if isinstance(event, dict) and cast("dict[str, Any]", event).get("type") == "result":
+            self.result_line = line
+
+    def on_stderr(self, line: str) -> None:
+        self._stderr_tail.append(line)
+        self._stderr_chars += len(line)
+        while self._stderr_chars > _MAX_STDERR_CHARS and len(self._stderr_tail) > 1:
+            self._stderr_chars -= len(self._stderr_tail.popleft())
+
+    @property
+    def stderr(self) -> str:
+        return "".join(self._stderr_tail)
+
+
+def _pump(stream: Any, sink: Callable[[str], None]) -> None:
+    """Drain a text stream line by line on a worker thread, passing each line to ``sink``."""
+    try:
+        for line in stream:
+            sink(line)
+    except (OSError, ValueError):  # pipe closed mid-read; the exit path handles it
+        pass
+    finally:
+        with contextlib.suppress(OSError):
+            stream.close()
+
+
+def _write_stdin(process: subprocess.Popen[str], prompt: str) -> None:
+    try:
+        if process.stdin is not None:
+            process.stdin.write(prompt)
+            process.stdin.close()
+    except (OSError, ValueError):
+        pass
+
+
 def _communicate(
     process: subprocess.Popen[str], prompt: str, timeout: float
 ) -> subprocess.CompletedProcess[str]:
-    """Feed the prompt in, read the streams out, and wait. Blocking; runs on a thread."""
+    """Feed the prompt in and stream the output, keeping only what the decoder needs.
+
+    Unlike ``Popen.communicate``, this never holds the whole transcript in memory (see
+    :class:`_TurnOutput`). Both pipes are drained on their own threads, and stdin is
+    written on another, so a full pipe cannot deadlock the child. Blocking; runs on a
+    worker thread.
+    """
+    out = _TurnOutput(process)
+    workers = [threading.Thread(target=_write_stdin, args=(process, prompt), daemon=True)]
+    if process.stdout is not None:
+        workers.append(
+            threading.Thread(target=_pump, args=(process.stdout, out.on_stdout), daemon=True)
+        )
+    if process.stderr is not None:
+        workers.append(
+            threading.Thread(target=_pump, args=(process.stderr, out.on_stderr), daemon=True)
+        )
+    for worker in workers:
+        worker.start()
+
     try:
-        stdout, stderr = process.communicate(prompt, timeout=timeout)
+        returncode = process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        # Popen.communicate() leaves the child running on timeout, unlike
-        # subprocess.run(); reap it here so the timeout is not itself a leak.
-        # Bounded, because the reaping read is itself a wait on the pipes.
+        # Popen leaves the child running on timeout; reap it so the timeout is not a leak.
         _kill_if_running(process)
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            process.communicate(timeout=_KILL_TIMEOUT_S)
+        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+            process.wait(timeout=_KILL_TIMEOUT_S)
         raise
+    for worker in workers:
+        worker.join(_KILL_TIMEOUT_S)
+
+    if out.overflowed:
+        raise claude_code.ClaudeCodeError(
+            f"claude -p produced over {_MAX_STDOUT_CHARS} characters of output"
+        )
     return subprocess.CompletedProcess(
-        args=process.args, returncode=process.wait(), stdout=stdout, stderr=stderr
+        args=process.args, returncode=returncode, stdout=out.result_line, stderr=out.stderr
     )
 
 

@@ -6,6 +6,7 @@ import asyncio
 import json
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -719,6 +720,60 @@ def test_stdin_payload_is_one_line_whatever_the_prompt_contains() -> None:
     assert encoded.isascii()
     rendered = json.loads(encoded)["message"]["content"][0]["text"]
     assert text in rendered
+
+
+def test_communicate_streams_and_keeps_only_the_result_line() -> None:
+    # The real transport (the tests above fake it): stdout is streamed and only the
+    # terminal result line survives; the prompt reaches the child over stdin.
+    script = """
+import sys
+sys.stdout.write('{"type":"system","subtype":"init"}\\n')
+sys.stdout.write('not json diagnostic noise\\n')
+sys.stdout.write('{"type":"result","is_error":false,"result":"{}"}\\n')
+sys.stdout.flush()
+sys.stderr.write('got stdin: ' + sys.stdin.read())
+"""
+    process = claude_process._spawn([sys.executable, "-c", script])
+    completed = claude_process._communicate(process, "PROMPT-123\n", timeout=30.0)
+    assert completed.returncode == 0
+    assert '"type":"result"' in completed.stdout
+    assert "init" not in completed.stdout
+    assert "diagnostic noise" not in completed.stdout
+    assert "PROMPT-123" in completed.stderr  # the prompt was delivered over stdin
+    assert claude_bridge.parse_transcript(completed.stdout.split("\n"))["type"] == "result"
+
+
+def test_communicate_raises_when_stdout_exceeds_the_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(claude_process, "_MAX_STDOUT_CHARS", 200)
+    script = """
+import sys, time
+for _ in range(100000):
+    sys.stdout.write('x' * 80 + '\\n')
+sys.stdout.flush()
+time.sleep(5)
+"""
+    process = claude_process._spawn([sys.executable, "-c", script])
+    with pytest.raises(claude_code.ClaudeCodeError, match="characters of output"):
+        claude_process._communicate(process, "x", timeout=30.0)
+
+
+def test_communicate_keeps_only_a_bounded_stderr_tail(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(claude_process, "_MAX_STDERR_CHARS", 200)
+    script = """
+import sys
+sys.stdout.write('{"type":"result","is_error":false,"result":"{}"}\\n')
+sys.stdout.flush()
+for i in range(500):
+    sys.stderr.write('E%04d\\n' % i)
+sys.stderr.flush()
+sys.stdin.read()
+"""
+    process = claude_process._spawn([sys.executable, "-c", script])
+    completed = claude_process._communicate(process, "x", timeout=30.0)
+    assert completed.returncode == 0
+    assert len(completed.stderr) <= 200 + 16  # bounded tail, one line of slack
+    assert "E0499" in completed.stderr  # keeps the tail
+    assert "E0000" not in completed.stderr  # drops the head
 
 
 def test_request_timeout_ignores_a_non_numeric_or_boolean_value() -> None:
