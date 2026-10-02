@@ -268,13 +268,23 @@ class _FakeProcess:
     communicate() has returned, so the cleanup kill is a no-op on the happy path.
     """
 
-    def __init__(self, *, running: bool = False, pid: int = 4321) -> None:
+    def __init__(
+        self, *, running: bool = False, pid: int = 4321, ignore_term: bool = False
+    ) -> None:
         self.killed = False
+        self.terminated = False
         self.pid = pid
         self._running = running
+        self._ignore_term = ignore_term
 
     def poll(self) -> int | None:
         return None if self._running else 0
+
+    def terminate(self) -> None:
+        self.terminated = True
+        if not self._ignore_term:
+            self.killed = True
+            self._running = False
 
     def kill(self) -> None:
         self.killed = True
@@ -664,7 +674,11 @@ def test_windows_kill_takes_the_whole_process_tree(monkeypatch: pytest.MonkeyPat
     assert process.killed is True
 
 
-def test_posix_kill_does_not_shell_out(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_posix_kill_terminates_gracefully_without_shelling_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # SIGTERM first (process.terminate) so claude can close its connection; never a
+    # taskkill/shell on POSIX. The child exits on SIGTERM, so no SIGKILL is needed.
     calls: list[list[str]] = []
 
     def _run(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[bytes]:
@@ -676,7 +690,22 @@ def test_posix_kill_does_not_shell_out(monkeypatch: pytest.MonkeyPatch) -> None:
     process = _FakeProcess(running=True)
     claude_process._kill_if_running(cast("subprocess.Popen[str]", process))
     assert calls == []
+    assert process.terminated is True
+    assert process.poll() == 0
+
+
+def test_posix_kill_escalates_to_sigkill_when_sigterm_is_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A child that ignores SIGTERM is SIGKILLed after the grace window, so an
+    # abandoned turn can never outlive its semaphore slot.
+    monkeypatch.setattr(claude_process, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(claude_process, "_KILL_GRACE_S", 0.1)
+    process = _FakeProcess(running=True, ignore_term=True)
+    claude_process._kill_if_running(cast("subprocess.Popen[str]", process))
+    assert process.terminated is True
     assert process.killed is True
+    assert process.poll() == 0
 
 
 def test_stdin_payload_is_one_line_whatever_the_prompt_contains() -> None:

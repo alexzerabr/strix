@@ -32,6 +32,7 @@ import os
 import shutil
 import subprocess  # we invoke a trusted, user-installed CLI, never a shell
 import sys
+import time
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -51,6 +52,9 @@ _DEFAULT_MAX_PROCS = 1
 _DEFAULT_TURN_TIMEOUT_S = 900
 # Reaping a killed child is a pipe read, so it gets its own small bound.
 _KILL_TIMEOUT_S = 10
+# After SIGTERM, how long to let claude abort its in-flight request and exit before
+# escalating to SIGKILL. Short, so a cancelled or timed-out turn frees its slot fast.
+_KILL_GRACE_S = 2.0
 # taskkill either reaps the tree at once or not at all. This runs inline on the
 # event loop, deliberately: the semaphore slot must not be released while the
 # child is still alive, which is the leak the kill exists to prevent. Kept short
@@ -233,13 +237,29 @@ def _kill_windows_tree(pid: int) -> None:
 
 
 def _kill_if_running(process: subprocess.Popen[str]) -> None:
-    """Kill the child unless it has already exited."""
+    """Stop the child unless it has already exited.
+
+    POSIX: SIGTERM first so ``claude`` can abort its in-flight request and close the
+    connection cleanly, then SIGKILL if it has not exited within ``_KILL_GRACE_S``.
+    Windows: ``taskkill /T`` reaps the whole tree (the npm shim is cmd.exe, whose node
+    grandchild holds the pipes). The kill runs to completion before the semaphore slot
+    is released, so an abandoned turn cannot outlive its slot.
+    """
     if process.poll() is not None:
         return
     if sys.platform == "win32":
         _kill_windows_tree(process.pid)
+        with contextlib.suppress(OSError):
+            process.kill()
+        return
     with contextlib.suppress(OSError):
-        process.kill()
+        process.terminate()
+    deadline = time.monotonic() + _KILL_GRACE_S
+    while process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if process.poll() is None:
+        with contextlib.suppress(OSError):
+            process.kill()
 
 
 def _communicate(
